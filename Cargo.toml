@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = ["crates/gateway"]
+
+[workspace.package]
+edition = "2021"
+version = "0.0.53"
+license-file = "LICENSE"

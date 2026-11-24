@@ -1,0 +1,24 @@
+# Local operating system files
+.DS_Store
+
+# Rust build output
+/target/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+
+# Runtime data
+/data/
+/logs/
+
+# G3 live-link credentials (CA keys, device token) — never commit
+/secrets/
+device-backups/
+
+# G6 emOS build staging (upstream clone, derived intermediates) — never commit
+build-staging/
+__pycache__/
+build/
+kws/hm-kws
