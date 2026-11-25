@@ -6,7 +6,8 @@ and the keyword line are tracked here.
 
 | Part | Source | Tracked? |
 |---|---|---|
-| `run.sh`, `kw.txt` | this directory | yes |
+| `run.sh` | `kws/run.sh` (canonical device-independent launcher) | yes |
+| `kw.txt` | this directory | yes |
 | `hm-kws` | `kws/build.sh` (this repo) | build artifact |
 | `libsherpa-onnx-c-api.so`, `libonnxruntime.so` | sherpa-onnx v1.12.15 `linux-aarch64-shared-cpu` release | no (third-party) |
 | `ld-linux-aarch64.so.1`, `libc.so.6`, `libm.so.6`, `libpthread.so.0`, `libdl.so.2`, `librt.so.1` | Debian 12 arm64 `libc6` (the device has no glibc loader) | no (third-party) |

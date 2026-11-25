@@ -60,15 +60,13 @@ async fn full_absorbed_component_contract() {
             "stop",
             "volume",
             "play_stream",
-            // v1 mechanism (#13/#14, 2026-11-16): remote mute + the
-            // formalized interrupt contract, then wifi (declared last —
-            // a radio-less form omits it and refuses WifiConfig).
+            // v1 mechanism (#13/#14, 2026-11-16): remote mute + config_apply_v2;
+            // KWS-specific capabilities (local_exit, interrupt_wake_word,
+            // interrupt_retreat_local_exit, config_block_kws) are only declared
+            // when cfg.kws == true, then wifi (declared last — a radio-less form
+            // omits it and refuses WifiConfig).
             "remote_mute",
-            "local_exit",
-            "interrupt_wake_word",
-            "interrupt_retreat_local_exit",
             "config_apply_v2",
-            "config_block_kws",
             "config_block_audio_eq",
             "config_block_led",
             "config_block_duplex",

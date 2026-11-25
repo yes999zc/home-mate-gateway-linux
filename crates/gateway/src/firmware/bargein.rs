@@ -180,8 +180,6 @@ pub struct Counters {
     pub guarded: u64,
     /// Facts reported north.
     pub fired: u64,
-    /// Guard evaluations on keyword hits that suppressed a self-heard hit.
-    pub kws_guarded: u64,
     /// Candidate onsets suppressed inside the playback settle window (R1).
     pub settled: u64,
     /// Candidate onsets suppressed because the reference was unlocked.

@@ -19,6 +19,48 @@ GW_LOG=/tmp/hm-gateway.log
 WD_LOG=/tmp/hm-watchdog.log
 INIT_D_DIR=/etc/init.d
 SHUT_LED_BIN=/bin/shut_led
+MEMINFO_FILE=/proc/meminfo
+HM_THIN_MEM_KB=180000
+HM_FLASH_MIN_FREE_KB=64
+KWS_PERSIST_FILES="kw.txt kw.exit.json kw.tuning.json kw.bundle.json"
+KWS_SYNC_BACKOFF_MAX=60
+kws_sync_fail_streak=0
+kws_sync_cooldown=0
+
+# 128 MB RAM LX06 batch (MemTotal ~118,760 kB, /tmp tmpfs ~59 MB) cannot host
+# on-device hm-core + hm-kws without OOM. Auto-enable gateway-only thin mode
+# when RAM < 180 MB, or when explicitly forced via HM_THIN_MODE=1 or
+# /data/hm/thin-mode. 256 MB units stay on full on-device hm-core --slim + KWS.
+read_mem_total_kb() {
+    [ -r "$MEMINFO_FILE" ] || return 1
+    while IFS= read -r line; do
+        case "$line" in
+            MemTotal:*)
+                val=$(
+                    set -f
+                    set -- $line
+                    printf '%s' "${2:-}"
+                )
+                case "$val" in
+                    ''|*[!0-9]*) return 1 ;;
+                    *)
+                        printf '%s\n' "$val"
+                        return 0
+                        ;;
+                esac
+                ;;
+        esac
+    done < "$MEMINFO_FILE"
+    return 1
+}
+
+is_thin_mode() {
+    if [ "${HM_THIN_MODE:-0}" = 1 ] || [ -f "$HM_FLASH_DIR/thin-mode" ]; then
+        return 0
+    fi
+    mem_kb=$(read_mem_total_kb) || return 1
+    [ "$mem_kb" -lt "$HM_THIN_MEM_KB" ]
+}
 
 # Only the dual-wake gateway coordinates pns while it is running. A pinned
 # native session has all of its original services, including the wake engine.
@@ -102,54 +144,175 @@ stop_runtime() {
     fi
 }
 
+stop_core() {
+    for old_pid in $(pidof hm-core 2>/dev/null); do
+        kill "$old_pid" 2>/dev/null || true
+        for attempt in 1 2 3; do
+            kill -0 "$old_pid" 2>/dev/null || break
+            sleep 1
+        done
+        if kill -0 "$old_pid" 2>/dev/null; then
+            kill -KILL "$old_pid" 2>/dev/null || true
+        fi
+    done
+}
+
 unpack_bundle_if_needed() {
+    thin=0
+    if is_thin_mode; then
+        thin=1
+    fi
     main_digest=""
     if [ -f "$HM_FLASH_DIR/hm-bundle.sha256" ]; then
         main_digest=$(cat "$HM_FLASH_DIR/hm-bundle.sha256")
         case "$main_digest" in *[!0-9a-f]*) return 1 ;; esac
         [ "${#main_digest}" -eq 64 ] || return 1
     fi
-    if [ -f "$HM_RUN_DIR/.lx06-idle-wake-v1" ] && [ -x "$HM_RUN_DIR/hm-core" ] &&
-        [ -x "$HM_RUN_DIR/hm-gateway" ] &&
-        [ "$(cat "$HM_RUN_DIR/.main-sha256" 2>/dev/null)" = "$main_digest" ]; then
-        return 0
+    if [ "$thin" = 1 ]; then
+        if [ -f "$HM_RUN_DIR/.lx06-idle-wake-v1" ] && [ -x "$HM_RUN_DIR/hm-gateway" ] &&
+            [ ! -e "$HM_RUN_DIR/hm-core" ] && [ ! -e "$HM_RUN_DIR/web" ] &&
+            [ "$(cat "$HM_RUN_DIR/.main-sha256" 2>/dev/null)" = "$main_digest" ]; then
+            return 0
+        fi
+    else
+        if [ -f "$HM_RUN_DIR/.lx06-idle-wake-v1" ] && [ -x "$HM_RUN_DIR/hm-core" ] &&
+            [ -x "$HM_RUN_DIR/hm-gateway" ] &&
+            [ "$(cat "$HM_RUN_DIR/.main-sha256" 2>/dev/null)" = "$main_digest" ]; then
+            return 0
+        fi
     fi
     if [ -n "$main_digest" ]; then
         [ "$(sha256sum "$HM_FLASH_DIR/hm-bundle.tar.xz" | cut -d ' ' -f 1)" = "$main_digest" ] || return 1
     fi
     mkdir -p "$HM_STATE_DIR/models"
-    echo "$(date) unpacking $HM_FLASH_DIR/hm-bundle.tar.xz -> $HM_RUN_DIR" >> "$WD_LOG"
+    echo "$(date) unpacking $HM_FLASH_DIR/hm-bundle.tar.xz -> $HM_RUN_DIR (thin=$thin)" >> "$WD_LOG"
     stage="$HM_RUN_DIR.part"
     rm -rf "$stage"
     mkdir -p "$stage" || return 1
     # Check both stages on BusyBox sh. Stream the xz directly from flash;
     # there is no room for another copy of the compressed archive in /data.
-    ( "$HM_FLASH_DIR/unxz" < "$HM_FLASH_DIR/hm-bundle.tar.xz" && touch "$stage/.unpacked" ) |
-        tar -xf - -C "$stage" &&
-        [ -f "$stage/.unpacked" ] && [ -s "$stage/hm-core" ] && [ -s "$stage/hm-gateway" ] &&
-        chmod +x "$stage/hm-core" "$stage/hm-gateway" || return 1
+    if [ "$thin" = 1 ]; then
+        # Extract ONLY hm-gateway (never hm-core, web/, or silero_vad.onnx) so
+        # a full bundle never spikes 59 MB /tmp tmpfs with the 12.6 MB hm-core.
+        ( "$HM_FLASH_DIR/unxz" < "$HM_FLASH_DIR/hm-bundle.tar.xz" && touch "$stage/.unpacked" ) |
+            tar -xf - -C "$stage" hm-gateway &&
+            [ -f "$stage/.unpacked" ] && [ -s "$stage/hm-gateway" ] &&
+            chmod +x "$stage/hm-gateway" || { rm -rf "$stage"; return 1; }
+    else
+        ( "$HM_FLASH_DIR/unxz" < "$HM_FLASH_DIR/hm-bundle.tar.xz" && touch "$stage/.unpacked" ) |
+            tar -xf - -C "$stage" &&
+            [ -f "$stage/.unpacked" ] && [ -s "$stage/hm-core" ] && [ -s "$stage/hm-gateway" ] &&
+            chmod +x "$stage/hm-core" "$stage/hm-gateway" || { rm -rf "$stage"; return 1; }
+    fi
     # Old LX06 binaries take exclusive ownership of audio. Only activate a
     # freshly unpacked archive after its gateway confirms the shared contract.
     [ "$("$stage/hm-gateway" lx06-wake-contract 2>> "$WD_LOG")" = lx06-idle-wake-v1 ] &&
-        touch "$stage/.lx06-idle-wake-v1" || return 1
-    echo "$main_digest" > "$stage/.main-sha256" || return 1
+        touch "$stage/.lx06-idle-wake-v1" || { rm -rf "$stage"; return 1; }
+    echo "$main_digest" > "$stage/.main-sha256" || { rm -rf "$stage"; return 1; }
     # The live directory is a disposable tmpfs cache, never persistent state.
     rm -rf "$HM_RUN_DIR"
     mv "$stage" "$HM_RUN_DIR" || return 1
-    ln -sf "$HM_RUN_DIR/silero_vad.onnx" "$HM_STATE_DIR/models/silero_vad.onnx"
+    if [ "$thin" = 0 ] && [ -s "$HM_RUN_DIR/silero_vad.onnx" ]; then
+        ln -sf "$HM_RUN_DIR/silero_vad.onnx" "$HM_STATE_DIR/models/silero_vad.onnx"
+    fi
 }
 
+flash_free_kb() {
+    df -k "$1" 2>/dev/null | sed -n '$p' | (
+        read -r _a _b c d _rest || exit 1
+        case "${d:-}" in
+            *%) val="$c" ;;
+            *) val="$d" ;;
+        esac
+        case "$val" in
+            ''|*[!0-9]*) exit 1 ;;
+            *) printf '%s\n' "$val" ;;
+        esac
+    )
+}
+
+# Initial restore only (before first gateway start on a fresh or pre-cached
+# tmpfs KWS dir). Steady-state ticks never resurrect deleted live files from
+# flash back into tmpfs.
+restore_kws_config() {
+    [ -d "$KWS_DIR" ] || return 0
+    [ ! -f "$KWS_DIR/.persist-restored" ] || return 0
+    for f in $KWS_PERSIST_FILES; do
+        disk="$HM_STATE_DIR/kws-persist/$f"
+        live="$KWS_DIR/$f"
+        if [ ! -e "$live" ] && [ -s "$disk" ]; then
+            if cp "$disk" "$live.tmp" 2>/dev/null && mv -f "$live.tmp" "$live" 2>/dev/null; then
+                :
+            else
+                rm -f "$live.tmp" 2>/dev/null || true
+                return 1
+            fi
+        fi
+    done
+    : > "$KWS_DIR/.persist-restored" 2>/dev/null || true
+}
+
+# Steady-state flash backup: atomic write via "$disk.tmp" + mv only when content
+# actually changed, guarded by free-space check and exponential backoff on error
+# so ENOSPC / flash faults never hammer UBIFS at 1 Hz or leave truncated files.
 sync_kws_config() {
-    mkdir -p "$HM_STATE_DIR/kws-persist"
-    for f in kw.txt kw.exit.json kw.tuning.json kw.bundle.json; do
+    if [ "${kws_sync_cooldown:-0}" -gt 0 ]; then
+        kws_sync_cooldown=$((kws_sync_cooldown - 1))
+        return 0
+    fi
+    [ -d "$KWS_DIR" ] || return 0
+    sync_failed=0
+    for f in $KWS_PERSIST_FILES; do
         disk="$HM_STATE_DIR/kws-persist/$f"
         live="$KWS_DIR/$f"
         if [ -s "$live" ]; then
-            cmp -s "$live" "$disk" || cp "$live" "$disk"
-        elif [ -s "$disk" ]; then
-            cp "$disk" "$live"
+            if cmp -s "$live" "$disk" 2>/dev/null; then
+                continue
+            fi
+            if ! mkdir -p "$HM_STATE_DIR/kws-persist" 2>/dev/null; then
+                sync_failed=1
+                break
+            fi
+            avail_kb=$(flash_free_kb "$HM_STATE_DIR" 2>/dev/null || echo "")
+            if [ -n "$avail_kb" ] && [ "$avail_kb" -lt "${HM_FLASH_MIN_FREE_KB:-64}" ]; then
+                sync_failed=1
+                break
+            fi
+            tmp="$disk.tmp"
+            if cp "$live" "$tmp" 2>/dev/null && mv -f "$tmp" "$disk" 2>/dev/null; then
+                :
+            else
+                rm -f "$tmp" 2>/dev/null || true
+                sync_failed=1
+                break
+            fi
+        elif [ ! -e "$live" ] && [ -e "$disk" ]; then
+            # Intentionally deleted in live tmpfs (e.g. tuning reset): remove
+            # the flash copy instead of resurrecting it back into tmpfs.
+            if ! rm -f "$disk" 2>/dev/null; then
+                sync_failed=1
+                break
+            fi
         fi
     done
+    if [ "$sync_failed" = 1 ]; then
+        kws_sync_fail_streak=$(( ${kws_sync_fail_streak:-0} + 1 ))
+        backoff=5
+        step=1
+        while [ "$step" -lt "$kws_sync_fail_streak" ] && [ "$backoff" -lt "$KWS_SYNC_BACKOFF_MAX" ]; do
+            backoff=$((backoff * 2))
+            step=$((step + 1))
+        done
+        if [ "$backoff" -gt "$KWS_SYNC_BACKOFF_MAX" ]; then
+            backoff=$KWS_SYNC_BACKOFF_MAX
+        fi
+        kws_sync_cooldown=$backoff
+        echo "$(date) kws persist sync failed (streak=$kws_sync_fail_streak, backoff=${backoff}s)" >> "$WD_LOG"
+        return 1
+    fi
+    kws_sync_fail_streak=0
+    kws_sync_cooldown=0
+    return 0
 }
 
 fetch_kws_if_needed() {
@@ -159,7 +322,7 @@ fetch_kws_if_needed() {
     [ "${#digest}" -eq 64 ] || return 1
     if [ -x "$KWS_DIR/run.sh" ] && [ -x "$KWS_DIR/hm-kws" ] &&
         [ "$(cat "$KWS_DIR/.archive-sha256" 2>/dev/null)" = "$digest" ]; then
-        sync_kws_config
+        restore_kws_config || return 1
         return 0
     fi
     [ -s "$HM_FLASH_DIR/kws.url" ] || return 1
@@ -179,11 +342,12 @@ fetch_kws_if_needed() {
         rm -f "$archive"
         echo "$digest" > "$stage/.archive-sha256" || return 1
         chmod +x "$stage/run.sh" "$stage/hm-kws" "$stage/ld-linux-aarch64.so.1" || return 1
-        for f in kw.txt kw.exit.json kw.tuning.json kw.bundle.json; do
+        for f in $KWS_PERSIST_FILES; do
             if [ -s "$HM_STATE_DIR/kws-persist/$f" ]; then
                 cp "$HM_STATE_DIR/kws-persist/$f" "$stage/$f" || return 1
             fi
         done
+        : > "$stage/.persist-restored" || return 1
         rm -rf "$KWS_DIR"
         mv "$stage" "$KWS_DIR" || return 1
         echo "$(date) keyword spotter ready" >> "$WD_LOG"
@@ -223,6 +387,7 @@ supervise_tick() {
         xiaoai-pinned)
             if [ "$last_mode" != xiaoai ]; then
                 stop_runtime firmware
+                stop_core
                 start_native_services
                 last_mode=xiaoai
             fi
@@ -248,6 +413,52 @@ supervise_tick() {
         restore_native_wake || return 1
     fi
     unpack_bundle_if_needed || return 1
+    if is_thin_mode; then
+        # 128 MB Thin Gateway mode: skip local hm-core and local hm-kws; connect
+        # directly to a LAN Full Docker hm-core (via /data/hm/core.addr + --allow-lan-core)
+        # or to an SSH reverse tunnel on 127.0.0.1:8932.
+        if ! runtime_pid hm-gateway firmware >/dev/null; then
+            core_addr="127.0.0.1:8932"
+            if [ -s "$HM_FLASH_DIR/core.addr" ]; then
+                addr_val=$(tr -d '\r\n ' < "$HM_FLASH_DIR/core.addr")
+                [ -z "$addr_val" ] || core_addr="$addr_val"
+            fi
+            core_token=""
+            if [ -s "$HM_FLASH_DIR/core.token" ]; then
+                chmod 600 "$HM_FLASH_DIR/core.token" 2>/dev/null || true
+                core_token=$(tr -d '\r\n' < "$HM_FLASH_DIR/core.token")
+            fi
+            dev_id="lx06"
+            if [ -s "$HM_STATE_DIR/device-id" ]; then
+                id_val=$(tr -d '\r\n ' < "$HM_STATE_DIR/device-id")
+                [ -z "$id_val" ] || dev_id="$id_val"
+            fi
+            vol_cap=1.0
+            [ ! -f "$HM_FLASH_DIR/silent" ] || vol_cap=0.0
+            case "$core_addr" in
+                127.*|localhost:*|"[::1]":*|"[::ffff:127."*)
+                    HM_FW_AUDIO_CPU=1 HM_FW_PLAY_CPU=0 HM_LOOP_DIR=/tmp/hm-loop \
+                        HM_LX06_DUAL_WAKE=1 HM_CORE_AUTH_TOKEN="$core_token" \
+                        "$HM_RUN_DIR/hm-gateway" firmware --core "$core_addr" \
+                        --device-id "$dev_id" --model LX06 \
+                        --state-dir "$HM_STATE_DIR" --aec --barge-in off \
+                        --loudness-bass 0.0 --loopback-probe \
+                        --volume-cap "$vol_cap" >> "$GW_LOG" 2>&1 &
+                    ;;
+                *)
+                    HM_FW_AUDIO_CPU=1 HM_FW_PLAY_CPU=0 HM_LOOP_DIR=/tmp/hm-loop \
+                        HM_LX06_DUAL_WAKE=1 HM_CORE_AUTH_TOKEN="$core_token" \
+                        "$HM_RUN_DIR/hm-gateway" firmware --core "$core_addr" --allow-lan-core \
+                        --device-id "$dev_id" --model LX06 \
+                        --state-dir "$HM_STATE_DIR" --aec --barge-in off \
+                        --loudness-bass 0.0 --loopback-probe \
+                        --volume-cap "$vol_cap" >> "$GW_LOG" 2>&1 &
+                    ;;
+            esac
+        fi
+        return 0
+    fi
+
     if ! pidof hm-core >/dev/null 2>&1; then
         HM_DATA_DIR="$HM_STATE_DIR" HM_BIND="0.0.0.0:8930" HM_GATEWAY_BIND="127.0.0.1:8932" \
             HM_WEB_DIR="$HM_RUN_DIR/web" HM_SILERO_VAD="$HM_RUN_DIR/silero_vad.onnx" \
@@ -258,16 +469,22 @@ supervise_tick() {
         if ! fetch_kws_if_needed; then
             return 1
         fi
+        dev_id="lx06"
+        if [ -s "$HM_STATE_DIR/device-id" ]; then
+            id_val=$(tr -d '\r\n ' < "$HM_STATE_DIR/device-id")
+            [ -z "$id_val" ] || dev_id="$id_val"
+        fi
         vol_cap=1.0
         [ ! -f "$HM_FLASH_DIR/silent" ] || vol_cap=0.0
         HM_FW_AUDIO_CPU=1 HM_FW_PLAY_CPU=0 HM_LOOP_DIR=/tmp/hm-loop \
             KWS_VAD_MODEL="$HM_RUN_DIR/silero_vad.onnx" HM_LX06_DUAL_WAKE=1 \
-            "$HM_RUN_DIR/hm-gateway" firmware --core 127.0.0.1:8932 --device-id lx06 \
+            "$HM_RUN_DIR/hm-gateway" firmware --core 127.0.0.1:8932 \
+            --device-id "$dev_id" --model LX06 \
             --state-dir "$HM_STATE_DIR" --aec --barge-in off --loudness-bass 0.0 \
             --loopback-probe --kws --kws-dir "$KWS_DIR" --kws-cpu 3 \
             --volume-cap "$vol_cap" >> "$GW_LOG" 2>&1 &
     else
-        sync_kws_config
+        sync_kws_config || true
     fi
 }
 
@@ -277,13 +494,14 @@ run_supervisor() {
     last_mode=""
     while true; do
         supervise_tick
-        # Keep runtime logs from crowding the RAM-backed KWS and main bundles.
+        # Keep runtime logs and loopback dumps from crowding the RAM-backed KWS and main bundles.
         use=$(df -k /tmp | sed -n 2p | tr -s " " | cut -d " " -f5 | tr -d "%")
         if [ "${use:-0}" -ge 85 ]; then
             : > "$CORE_LOG"
             : > "$GW_LOG"
             : > "$WD_LOG"
             rm -f /tmp/hm-voice-events/voice-events-*.jsonl 2>/dev/null || true
+            rm -f /tmp/hm-loop/*.pcm 2>/dev/null || true
         fi
         sleep 1
     done

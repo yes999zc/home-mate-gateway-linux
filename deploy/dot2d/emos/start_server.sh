@@ -217,15 +217,11 @@ echo "$BOOT_COUNT" > "$BOOT_COUNT_FILE" 2>/dev/null
 
 sup_log "boot=#$BOOT_COUNT slot=$(readlink $DIR/current 2>/dev/null) core=$CORE"
 
-# G6 device-side AEC runs on emOS (the validated FireOS form stays as-is).
-# --loopback-probe: DAC-side + ch8 tracks on /run tmpfs for the core's
+# Device-side AEC and bounded loopback probe run on both emOS and FireOS.
+# --loopback-probe: DAC-side + ch8 tracks on tmpfs for the core's
 # playback_loopback diagnostic (task B). Bounded (960KB/track) and reset at
 # every play start; no /data writes, no effect on the audio path.
-if [ "$EMO" = "1" ]; then
-    AEC_FLAG="--aec --loopback-probe"
-else
-    AEC_FLAG="--aec --loopback-probe"
-fi
+AEC_FLAG="--aec --loopback-probe"
 
 # D/T4 keyword interruption: the firmware feeds its post-AEC block to the
 # local spotter (own process, cpu3) and reports detections north. The core
@@ -258,19 +254,27 @@ if [ -r "$DIR/barge-args" ]; then
     sup_log "barge args: $BARGE_FLAG"
 fi
 
-# Node identity (2026-11-14, provisioning): one supervisor script for every
-# device. A bootstrap seed writes $DIR/device-id; absent = the firmware
-# default (dot2-d), which is what every pre-provisioning install relies on.
-# Kept as a FILE rather than a patched script line so the seed never ships a
-# forked copy of this file and dot2-d stays byte-identical to the repo.
-DEVICE_FLAG=""
-if [ -r "$DIR/device-id" ]; then
-    DEVICE_ID=$(cat "$DIR/device-id" 2>/dev/null)
-    case "$DEVICE_ID" in
-        ''|*[!a-z0-9-]*) sup_log "ignoring invalid device-id '$DEVICE_ID'" ;;
-        *) DEVICE_FLAG="--device-id $DEVICE_ID" ;;
-    esac
+# Node identity (#22): one supervisor script for every device. Production
+# firmware (`resolve_production_device_id`) hard-exits without an explicit
+# identity and NEVER falls back to "dot2-d". Fail loudly here before entering
+# the supervisor loop if $DIR/device-id is missing or invalid so fast-exit A/B
+# rollback slots are not burned on an unprovisioned unit.
+if [ ! -r "$DIR/device-id" ]; then
+    sup_log "ERROR missing $DIR/device-id — refusing to start (provision e.g.: echo dot2-d > $DIR/device-id)"
+    echo "ERROR: missing $DIR/device-id; production firmware has no default fallback. Provision it before starting." >&2
+    exit 1
 fi
+DEVICE_ID=$(cat "$DIR/device-id" 2>/dev/null)
+case "$DEVICE_ID" in
+    ''|*[!a-z0-9-]*)
+        sup_log "ERROR invalid $DIR/device-id '$DEVICE_ID' (must match [a-z0-9-]+) — refusing to start"
+        echo "ERROR: invalid $DIR/device-id '$DEVICE_ID' (must match [a-z0-9-]+)." >&2
+        exit 1
+        ;;
+    *)
+        DEVICE_FLAG="--device-id $DEVICE_ID"
+        ;;
+esac
 
 while true; do
     make_room

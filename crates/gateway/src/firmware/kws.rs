@@ -149,10 +149,32 @@ pub(crate) fn wake_phrase_window_ms(fed_ms: u64, lag_ms: Option<u64>) -> u64 {
 pub type SharedStatus = Arc<Mutex<KwsStatus>>;
 
 /// Contract v2 §2.5 (#5, 2026-11-16): what the reader does when the spotted
-/// word's intent is `retreat`. The firmware cuts its own audio and reports
-/// the fact; the CORE still closes the session. Returns true when a local
-/// exit actually started (the caller logs it; nothing else depends on it).
-pub type RetreatSink = Arc<dyn Fn(&str, u64) -> bool + Send + Sync>;
+/// word's intent is `retreat`. The firmware cuts its own audio and defers the
+/// `Keyword` frame until `FlushDone` emits `LocalExitFlushed` (returning `None`
+/// when deferred, or `Some(frame)` when nothing needed flushing so the caller
+/// sends `Keyword` immediately).
+pub type RetreatSink = Arc<dyn Fn(&str, u64, GatewayFrame) -> Option<GatewayFrame> + Send + Sync>;
+
+/// Sidecar reload lifecycle facts for deferring `ConfigApply(Kws)` receipts
+/// until the newly spawned `hm-kws` child actually reaches `ready` or fails.
+#[derive(Debug, Clone)]
+pub enum KwsLifecycleEvent {
+    Ready {
+        reload_gen: u64,
+        load_ms: u64,
+        threshold: Option<f32>,
+        score: Option<f32>,
+        loaded_hash: Option<String>,
+        local_exit: u32,
+    },
+    Failed {
+        reload_gen: u64,
+        error_code: &'static str,
+        detail: String,
+    },
+}
+
+pub type KwsLifecycleSink = Arc<dyn Fn(KwsLifecycleEvent) + Send + Sync>;
 
 /// Contract v2 §2.5 (#5): may this hit be acted on locally? Yes only when
 /// the word's intent is retreat AND the echo guard did not suspect the
@@ -269,6 +291,8 @@ pub struct KwsControl {
     pid: Arc<AtomicU64>,
     intentional: Arc<std::sync::atomic::AtomicBool>,
     signalled_at: Arc<AtomicU64>,
+    reload_gen: Arc<AtomicU64>,
+    wake: Arc<(Mutex<u64>, std::sync::Condvar)>,
 }
 
 impl KwsControl {
@@ -286,6 +310,19 @@ impl KwsControl {
         }
         self.signalled_at.store(now_ms(), Ordering::SeqCst);
         true
+    }
+
+    /// Advance the reload generation, wake any backoff wait immediately, and
+    /// signal any running sidecar to restart. Returns `(target_gen, signalled)`.
+    pub fn request_reload(&self) -> (u64, bool) {
+        let target = self.reload_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let (lock, cv) = &*self.wake;
+        if let Ok(mut g) = lock.lock() {
+            *g = target;
+            cv.notify_all();
+        }
+        let signalled = self.restart();
+        (target, signalled)
     }
 }
 
@@ -462,7 +499,7 @@ pub fn spawn(
     level: Option<LevelSource>,
     retreat: Option<RetreatSink>,
 ) -> KwsFeed {
-    spawn_with_admission(dir, cpu, device, north, guard, level, retreat, None)
+    spawn_with_admission(dir, cpu, device, north, guard, level, retreat, None, None)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -475,6 +512,7 @@ pub(super) fn spawn_with_admission(
     level: Option<LevelSource>,
     retreat: Option<RetreatSink>,
     admit: Option<HitAdmission>,
+    lifecycle: Option<KwsLifecycleSink>,
 ) -> KwsFeed {
     let initial_bundle = load_bundle_meta(&dir);
     let status: SharedStatus = Arc::new(Mutex::new(KwsStatus {
@@ -491,12 +529,16 @@ pub(super) fn spawn_with_admission(
     let pid = Arc::new(AtomicU64::new(0));
     let intentional = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let signalled_at = Arc::new(AtomicU64::new(0));
+    let reload_gen = Arc::new(AtomicU64::new(0));
+    let wake = Arc::new((Mutex::new(0u64), std::sync::Condvar::new()));
     let vad_state = Arc::new(AtomicU8::new(VAD_UNKNOWN));
     let control = KwsControl {
         dir: dir.clone(),
         pid: pid.clone(),
         intentional: intentional.clone(),
         signalled_at: signalled_at.clone(),
+        reload_gen: reload_gen.clone(),
+        wake: wake.clone(),
     };
     let feed = KwsFeed {
         tx: tx.clone(),
@@ -522,11 +564,14 @@ pub(super) fn spawn_with_admission(
                 level,
                 retreat,
                 admit,
+                lifecycle,
                 status,
                 tx,
                 pid_sup,
                 intentional_sup,
                 signalled_sup,
+                reload_gen,
+                wake,
                 vad_state,
             )
         })
@@ -545,12 +590,19 @@ pub type NorthSink = Arc<dyn Fn(GatewayFrame) + Send + Sync>;
 /// `Command::spawn` is exactly what produced one trap dump per retry
 /// (R0 gateway §5). With this check a missing bundle costs no syscall the
 /// kernel does not know.
-fn script_ready(script: &std::path::Path) -> bool {
+pub(super) fn script_ready(script: &std::path::Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     let Ok(c) = std::ffi::CString::new(script.as_os_str().as_bytes()) else {
         return false;
     };
     unsafe { libc::access(c.as_ptr(), libc::X_OK) == 0 }
+}
+
+fn wait_or_wake(wake: &(Mutex<u64>, std::sync::Condvar), seen_gen: u64, dur: std::time::Duration) {
+    let (lock, cv) = wake;
+    if let Ok(guard) = lock.lock() {
+        let _ = cv.wait_timeout_while(guard, dur, |g| *g <= seen_gen);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -564,20 +616,33 @@ fn supervise(
     level: Option<LevelSource>,
     retreat: Option<RetreatSink>,
     admit: Option<HitAdmission>,
+    lifecycle: Option<KwsLifecycleSink>,
     status: SharedStatus,
     tx: Arc<Mutex<Option<SyncSender<Vec<u8>>>>>,
     pid: Arc<AtomicU64>,
     intentional: Arc<std::sync::atomic::AtomicBool>,
     signalled_at: Arc<AtomicU64>,
+    reload_gen: Arc<AtomicU64>,
+    wake: Arc<(Mutex<u64>, std::sync::Condvar)>,
     vad_state: Arc<AtomicU8>,
 ) {
     let mut attempt = 0usize;
     let mut reported_off = false;
     loop {
         vad_state.store(VAD_UNKNOWN, Ordering::Release);
+        let spawn_gen = reload_gen.load(Ordering::SeqCst);
         // Missing bundle: report once, then poll cheaply. Never call spawn —
         // it would statx per retry and flood the trap log (R0 finding).
         if !script_ready(&script) {
+            if spawn_gen > 0 {
+                if let Some(lc) = &lifecycle {
+                    lc(KwsLifecycleEvent::Failed {
+                        reload_gen: spawn_gen,
+                        error_code: "kws_sidecar_unavailable",
+                        detail: format!("keyword sidecar not installed: {}", script.display()),
+                    });
+                }
+            }
             if !reported_off {
                 set_status(
                     &status,
@@ -592,7 +657,11 @@ fn supervise(
                 );
                 reported_off = true;
             }
-            std::thread::sleep(std::time::Duration::from_secs(KWS_MISSING_POLL_SECS));
+            wait_or_wake(
+                &wake,
+                spawn_gen,
+                std::time::Duration::from_secs(KWS_MISSING_POLL_SECS),
+            );
             continue;
         }
         reported_off = false;
@@ -643,21 +712,33 @@ fn supervise(
         let mut child: Child = match child {
             Ok(c) => c,
             Err(e) => {
-                set_status(
-                    &status,
-                    "down",
-                    format!("spawn {}: {e}", script.display()),
-                    false,
-                );
+                let detail = format!("spawn {}: {e}", script.display());
+                set_status(&status, "down", detail.clone(), false);
                 north(status_frame(&device, &status));
-                sleep_backoff(attempt);
+                if let Some(lc) = &lifecycle {
+                    lc(KwsLifecycleEvent::Failed {
+                        reload_gen: spawn_gen,
+                        error_code: "kws_spawn_failed",
+                        detail,
+                    });
+                }
+                sleep_backoff(&wake, spawn_gen, attempt);
                 attempt += 1;
                 continue;
             }
         };
-        pid.store(child.id() as u64, Ordering::SeqCst);
+        let child_pid = child.id() as u64;
+        pid.store(child_pid, Ordering::SeqCst);
         // Fresh process, no stop request outstanding yet.
         signalled_at.store(0, Ordering::SeqCst);
+        // Close the TOCTOU window: if a newer ConfigApply(Kws) landed while we
+        // were spawning, terminate this stale child right away and respawn.
+        if reload_gen.load(Ordering::SeqCst) > spawn_gen {
+            intentional.store(true, Ordering::SeqCst);
+            if unsafe { libc::kill(child_pid as i32, libc::SIGTERM) } == 0 {
+                signalled_at.store(now_ms(), Ordering::SeqCst);
+            }
+        }
         // Fresh queue per process: stale blocks from a previous run would
         // only waste the new model's first chunk.
         let (ntx, nrx) = sync_channel::<Vec<u8>>(QUEUE_BLOCKS);
@@ -676,15 +757,30 @@ fn supervise(
         let hash_r = spawn_hash.clone();
         let retreat_r = retreat.clone();
         let admit_r = admit.clone();
+        let lifecycle_r = lifecycle.clone();
         let exit_r = exit_words.clone();
         let vad_r = vad_state.clone();
+        let saw_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_ready_r = saw_ready.clone();
         let reader = std::thread::Builder::new()
             .name("kws-reader".into())
             .spawn(move || {
                 if let Some(out) = stdout {
                     read_events(
-                        out, &device_r, &north_r, &guard_r, &level_r, &retreat_r, &admit_r,
-                        &exit_r, &status_r, hash_r, &vad_r,
+                        out,
+                        &device_r,
+                        &north_r,
+                        &guard_r,
+                        &level_r,
+                        &retreat_r,
+                        &admit_r,
+                        &lifecycle_r,
+                        &exit_r,
+                        &status_r,
+                        hash_r,
+                        &vad_r,
+                        spawn_gen,
+                        &saw_ready_r,
                     );
                 }
             })
@@ -709,10 +805,12 @@ fn supervise(
             st.loaded_ms = 0;
         }
         let ran = started.elapsed().as_secs();
+        let was_intentional = intentional.swap(false, Ordering::SeqCst);
+        let latest_gen = reload_gen.load(Ordering::SeqCst);
         // R1j/P1: a deploy restart is deliberate. It is NOT a sidecar
         // failure, so it must not spend the failure budget (RJ-4 counts
         // restarts as zero) — and it restarts immediately, no backoff.
-        if intentional.swap(false, Ordering::SeqCst) {
+        if was_intentional || latest_gen > spawn_gen {
             set_status(
                 &status,
                 "starting",
@@ -723,25 +821,25 @@ fn supervise(
             attempt = 0;
             continue;
         }
-        match exit {
-            Ok(st) => set_status(
-                &status,
-                "down",
-                format!("sidecar exited ({st}) after {ran}s — restarting"),
-                true,
-            ),
-            Err(e) => set_status(
-                &status,
-                "down",
-                format!("wait failed: {e} — restarting"),
-                true,
-            ),
+        let exit_detail = match &exit {
+            Ok(st) => format!("sidecar exited ({st}) after {ran}s — restarting"),
+            Err(e) => format!("wait failed: {e} — restarting"),
+        };
+        if !saw_ready.load(Ordering::Acquire) {
+            if let Some(lc) = &lifecycle {
+                lc(KwsLifecycleEvent::Failed {
+                    reload_gen: spawn_gen,
+                    error_code: "kws_sidecar_exited",
+                    detail: exit_detail.clone(),
+                });
+            }
         }
+        set_status(&status, "down", exit_detail, true);
         north(status_frame(&device, &status));
         if ran >= HEALTHY_SECS {
             attempt = 0;
         }
-        sleep_backoff(attempt);
+        sleep_backoff(&wake, spawn_gen, attempt);
         attempt += 1;
     }
 }
@@ -786,10 +884,10 @@ fn reap(
     }
 }
 
-fn sleep_backoff(attempt: usize) {
+fn sleep_backoff(wake: &(Mutex<u64>, std::sync::Condvar), seen_gen: u64, attempt: usize) {
     let secs = BACKOFF_SECS[attempt.min(BACKOFF_SECS.len() - 1)];
     fwlog!("[kws] supervisor backoff {secs}s (attempt {})", attempt + 1);
-    std::thread::sleep(std::time::Duration::from_secs(secs));
+    wait_or_wake(wake, seen_gen, std::time::Duration::from_secs(secs));
 }
 
 fn set_status(status: &SharedStatus, state: &str, detail: String, restart: bool) {
@@ -845,10 +943,13 @@ fn read_events(
     level: &Option<LevelSource>,
     retreat: &Option<RetreatSink>,
     admit: &Option<HitAdmission>,
+    lifecycle: &Option<KwsLifecycleSink>,
     exit_words: &std::collections::HashSet<String>,
     status: &SharedStatus,
     spawn_hash: Option<String>,
     vad_state: &AtomicU8,
+    spawn_gen: u64,
+    saw_ready: &std::sync::atomic::AtomicBool,
 ) {
     let reader = BufReader::new(stdout);
     for line in reader.lines() {
@@ -859,6 +960,7 @@ fn read_events(
                 threshold,
                 score,
             } => {
+                saw_ready.store(true, Ordering::Release);
                 let mut st = status.lock().unwrap();
                 st.state = "running".into();
                 // #4: the model's OWN numbers are the applied fact.
@@ -883,6 +985,16 @@ fn read_events(
                 drop(st);
                 fwlog!("[kws] sidecar ready in {load_ms}ms");
                 north(status_frame(device, status));
+                if let Some(lc) = lifecycle {
+                    lc(KwsLifecycleEvent::Ready {
+                        reload_gen: spawn_gen,
+                        load_ms,
+                        threshold,
+                        score,
+                        loaded_hash: spawn_hash.clone(),
+                        local_exit: exit_words.len() as u32,
+                    });
+                }
             }
             DriverEvent::Keyword {
                 keyword,
@@ -913,31 +1025,7 @@ fn read_events(
                     drop(st);
                     fwlog!("[kws] guard suspects a self-heard hit '{keyword}' (fed {fed_ms}ms) — reported as a hint");
                 }
-                // Contract v2 §2.5 (#5, 2026-11-16): a RETREAT word the guard
-                // did NOT call self-heard cuts this device's audio now. The
-                // hit still goes north (the core closes the session); the
-                // local flush only removes the delay. A self-heard hit is
-                // never acted on locally — the echo guard keeps its veto.
-                if local_exit_for(&keyword, exit_words, suspected) {
-                    match retreat.as_ref().map(|r| r(&keyword, fed_ms)) {
-                        Some(true) => {
-                            let mut st = status.lock().unwrap();
-                            st.detail = format!("local exit: '{keyword}' flushed the audio");
-                            drop(st);
-                            fwlog!("[kws] HIT {keyword} is a retreat word — local exit running");
-                        }
-                        Some(false) => {
-                            fwlog!(
-                                "[kws] HIT {keyword} is a retreat word — nothing to flush locally, reporting north"
-                            );
-                        }
-                        None => {
-                            // No sink (firmware built without the local-exit
-                            // closure): report only, exactly as before #5.
-                        }
-                    }
-                }
-                let ts = north_keyword(
+                let kw_frame = north_keyword(
                     device, &keyword, fed_ms, hit_ms, status, suspected, rms, lag_ms, &meta,
                 );
                 fwlog!(
@@ -950,7 +1038,36 @@ fn read_events(
                         .map(|l| format!("{l}ms"))
                         .unwrap_or_else(|| "n/a".into())
                 );
-                north(ts);
+                // Contract v2 §2.5 (#5, 2026-11-16): a RETREAT word the guard
+                // did NOT call self-heard cuts this device's audio now and
+                // defers sending `Keyword` until `FlushDone` emits
+                // `LocalExitFlushed` so Core observes the local flush strictly
+                // BEFORE `Keyword` closes the session.
+                let send_now = if local_exit_for(&keyword, exit_words, suspected) {
+                    match retreat {
+                        Some(r) => match r(&keyword, fed_ms, kw_frame) {
+                            None => {
+                                let mut st = status.lock().unwrap();
+                                st.detail = format!("local exit: '{keyword}' flushed the audio");
+                                drop(st);
+                                fwlog!("[kws] HIT {keyword} is a retreat word — local exit running (keyword deferred until flush)");
+                                None
+                            }
+                            Some(frame) => {
+                                fwlog!(
+                                    "[kws] HIT {keyword} is a retreat word — nothing to flush locally, reporting north"
+                                );
+                                Some(frame)
+                            }
+                        },
+                        None => Some(kw_frame),
+                    }
+                } else {
+                    Some(kw_frame)
+                };
+                if let Some(frame) = send_now {
+                    north(frame);
+                }
             }
             DriverEvent::Vad { speech, .. } => {
                 vad_state.store(
@@ -967,8 +1084,18 @@ fn read_events(
             }
             DriverEvent::Error { stage } => {
                 vad_state.store(VAD_UNKNOWN, Ordering::Release);
-                set_status(status, "down", format!("sidecar error at {stage}"), false);
+                let detail = format!("sidecar error at {stage}");
+                set_status(status, "down", detail.clone(), false);
                 north(status_frame(device, status));
+                if !saw_ready.load(Ordering::Acquire) {
+                    if let Some(lc) = lifecycle {
+                        lc(KwsLifecycleEvent::Failed {
+                            reload_gen: spawn_gen,
+                            error_code: "kws_sidecar_error",
+                            detail,
+                        });
+                    }
+                }
             }
             DriverEvent::Unknown => {}
         }
@@ -1080,382 +1207,5 @@ pub fn next_seq(seq: &AtomicU64) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-
-    #[test]
-    fn a_missing_sidecar_is_not_spawned() {
-        let dir = std::env::temp_dir().join(format!("hm-kws-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let script = dir.join("run.sh");
-        assert!(
-            !script_ready(&script),
-            "absent script must not look runnable"
-        );
-        std::fs::write(&script, "#!/bin/sh\ntrue\n").unwrap();
-        assert!(
-            !script_ready(&script),
-            "non-executable script must not look runnable"
-        );
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(script_ready(&script), "executable script is runnable");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-    use super::*;
-
-    #[test]
-    fn parses_ready_and_keyword_lines() {
-        assert_eq!(
-            parse_event_line(r#"{"event":"ready","name":"dot2-d","load_ms":6797}"#),
-            DriverEvent::Ready {
-                load_ms: 6797,
-                threshold: None,
-                score: None
-            }
-        );
-        assert_eq!(
-            parse_event_line(
-                r#"{"event":"keyword","keyword":"你好高达","fed_samples":43520,"fed_ms":2720,"last_token_s":0.84,"detect_ms":1880,"wall_ms":649750,"n":1}"#
-            ),
-            DriverEvent::Keyword {
-                keyword: "你好高达".into(),
-                fed_ms: 2720,
-                lag_ms: None,
-                meta: KeywordMeta::default(),
-            }
-        );
-        assert_eq!(
-            parse_event_line(
-                r#"{"event":"keyword","keyword":"你好小智","fed_ms":3200,"lag_ms":40,"wake_dur_ms":720,"max_gap_ms":160,"tier":"real","l2_passed":true,"l2_ms":18}"#
-            ),
-            DriverEvent::Keyword {
-                keyword: "你好小智".into(),
-                fed_ms: 3200,
-                lag_ms: Some(40),
-                meta: KeywordMeta {
-                    tier: Some("real".into()),
-                    wake_dur_ms: Some(720),
-                    max_gap_ms: Some(160),
-                    l2_passed: Some(true),
-                },
-            }
-        );
-    }
-
-    #[test]
-    fn ignores_log_noise_and_malformed_lines() {
-        assert_eq!(parse_event_line("[kws] HIT 你好高达"), DriverEvent::Unknown);
-        assert_eq!(parse_event_line("{not json"), DriverEvent::Unknown);
-        assert_eq!(
-            parse_event_line(r#"{"event":"something_new"}"#),
-            DriverEvent::Unknown
-        );
-    }
-
-    #[test]
-    fn error_line_names_the_stage() {
-        assert_eq!(
-            parse_event_line(r#"{"event":"error","stage":"load","load_ms":12}"#),
-            DriverEvent::Error {
-                stage: "load".into()
-            }
-        );
-    }
-
-    /// 2026-11-14 field defect: on a MUTED device no PCM reaches the
-    /// sidecar, so a driver parked in a (SA_RESTART) `read()` ignored
-    /// SIGTERM; `reflex.deploy` was accepted, the old vocabulary kept
-    /// running, and only a firmware restart applied the file. The manager
-    /// was even told "spotter restarting" because `kill()` had succeeded.
-    ///
-    /// The driver now polls with a timeout, but the deploy contract must not
-    /// depend on the sidecar cooperating: this test uses a sidecar that
-    /// deliberately ignores SIGTERM and asserts the supervisor still replaces
-    /// it (SIGKILL escalation) without spending the failure budget.
-    #[test]
-    fn a_deploy_replaces_a_sidecar_that_ignores_sigterm() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("hm-kws-kill-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let starts = dir.join("starts");
-        let script = dir.join("run.sh");
-        // Records each spawn, refuses to die on SIGTERM, and blocks in a
-        // shell builtin (no child process to leak). `read` also never sees
-        // data: the supervisor feeds nothing unless audio arrives.
-        std::fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\necho start >> \"{}\"\ntrap '' TERM\nread line\n",
-                starts.display()
-            ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::write(dir.join("kw.txt"), "n ǐ h ǎo g āo d á @你好高达\n").unwrap();
-
-        let north: NorthSink = Arc::new(|_f: GatewayFrame| {});
-        let feed = spawn(dir.clone(), 3, "test".into(), north, None, None, None);
-        assert!(
-            wait_for_spawns(&starts, 1, 5_000),
-            "first sidecar never started"
-        );
-
-        // The supervisor stores the pid just after spawn. On a fast host the
-        // script's "start" line can land before that store, so restart()
-        // briefly sees pid 0. Poll until a signal is actually delivered.
-        let signalled = {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(2_000);
-            loop {
-                if feed.control().restart() {
-                    break true;
-                }
-                if std::time::Instant::now() >= deadline {
-                    break false;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-        };
-        assert!(signalled, "a live sidecar must be signalled");
-        // SIGKILL escalation is 1500 ms; allow generous slack for CI hosts.
-        assert!(
-            wait_for_spawns(&starts, 2, 6_000),
-            "the supervisor did not replace a sidecar that ignored SIGTERM"
-        );
-
-        let status = feed.status();
-        let st = status.lock().unwrap();
-        assert_eq!(
-            st.restarts, 0,
-            "a deliberate deploy restart is not a failure"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// How many times has the fake sidecar started? Polls until `at_least`
-    /// lines are present or the deadline passes.
-    fn wait_for_spawns(path: &std::path::Path, at_least: usize, timeout_ms: u64) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-        loop {
-            let n = std::fs::read_to_string(path)
-                .map(|s| s.lines().count())
-                .unwrap_or(0);
-            if n >= at_least {
-                return true;
-            }
-            if std::time::Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-    }
-
-    #[test]
-    fn keyword_frame_carries_the_fact_and_counts() {
-        let status: SharedStatus = Arc::new(Mutex::new(KwsStatus::default()));
-        let meta = KeywordMeta {
-            tier: Some("suspect".into()),
-            wake_dur_ms: Some(180),
-            max_gap_ms: Some(420),
-            l2_passed: Some(false),
-        };
-        let frame = north_keyword(
-            "dot2-d",
-            "你好高达",
-            2720,
-            1_700_000_000_000,
-            &status,
-            false,
-            Some(-31.5),
-            Some(90),
-            &meta,
-        );
-        match frame {
-            GatewayFrame::Keyword {
-                device,
-                keyword,
-                fed_ms,
-                self_heard,
-                kws_tier,
-                wake_dur_ms,
-                max_gap_ms,
-                l2_passed,
-                ..
-            } => {
-                assert_eq!(device, "dot2-d");
-                assert_eq!(keyword, "你好高达");
-                assert_eq!(fed_ms, Some(2720));
-                assert!(!self_heard);
-                assert_eq!(kws_tier.as_deref(), Some("suspect"));
-                assert_eq!(wake_dur_ms, Some(180));
-                assert_eq!(max_gap_ms, Some(420));
-                assert_eq!(l2_passed, Some(false));
-            }
-            other => panic!("wrong frame: {other:?}"),
-        }
-        let st = status.lock().unwrap();
-        assert_eq!(st.detections, 1);
-        assert_eq!(st.guarded, 0);
-        assert_eq!(st.last_keyword_ms, 1_700_000_000_000);
-    }
-
-    /// R1g: a guarded hit is REPORTED with the hint, counted in both numbers
-    /// (guarded ⊆ detections) — never silently eaten (that made the wake word
-    /// unusable during our own playback).
-    #[test]
-    fn a_guarded_hit_is_reported_as_a_hint_not_dropped() {
-        let status: SharedStatus = Arc::new(Mutex::new(KwsStatus::default()));
-        let frame = north_keyword(
-            "dot2-d",
-            "你好高达",
-            100,
-            1_700_000_000_000,
-            &status,
-            true,
-            None,
-            None,
-            &KeywordMeta::default(),
-        );
-        match frame {
-            GatewayFrame::Keyword { self_heard, .. } => assert!(self_heard),
-            other => panic!("wrong frame: {other:?}"),
-        }
-        let st = status.lock().unwrap();
-        assert_eq!(st.detections, 1);
-        assert_eq!(st.guarded, 1);
-    }
-
-    #[test]
-    fn feed_without_sidecar_drops_instead_of_blocking() {
-        let status: SharedStatus = Arc::new(Mutex::new(KwsStatus::default()));
-        let feed = KwsFeed {
-            tx: Arc::new(Mutex::new(None)),
-            status: status.clone(),
-            control: KwsControl {
-                dir: PathBuf::from("/nonexistent"),
-                pid: Arc::new(AtomicU64::new(0)),
-                intentional: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                signalled_at: Arc::new(AtomicU64::new(0)),
-            },
-            vad_state: Arc::new(AtomicU8::new(VAD_UNKNOWN)),
-        };
-        let block = vec![0i16; 1280];
-        feed.feed(&block);
-        feed.feed(&block);
-        assert_eq!(status.lock().unwrap().dropped_blocks, 2);
-    }
-
-    #[test]
-    fn mono_ms_moves_forward() {
-        let a = mono_ms();
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        let b = mono_ms();
-        assert!(b >= a, "monotonic clock went backwards: {a} -> {b}");
-    }
-
-    /// Contract v2 §2.5 (#5): the local exit is armed only for a retreat word
-    /// the guard did not call self-heard. Both vetoes matter: a wake word must
-    /// never cut the audio, and our own answer saying 「停止播放」 is not a
-    /// person asking.
-    #[test]
-    fn only_an_unshadowed_retreat_word_is_acted_on_locally() {
-        let mut words = std::collections::HashSet::new();
-        words.insert("停止播放".to_string());
-        assert!(local_exit_for("停止播放", &words, false));
-        assert!(
-            local_exit_for(" 停止播放 ", &words, false),
-            "the driver's text is trimmed"
-        );
-        assert!(
-            !local_exit_for("停止播放", &words, true),
-            "self-heard: the guard keeps its veto"
-        );
-        assert!(
-            !local_exit_for("你好高达", &words, false),
-            "a wake word is not an exit"
-        );
-        assert!(
-            !local_exit_for("停止播放", &std::collections::HashSet::new(), false),
-            "no set, no exit"
-        );
-    }
-
-    /// Contract v2 #4: the sensitivity file is what the launcher reads as
-    /// `KWS_THRESHOLD`/`KWS_SCORE`; a removed file returns the bundle default.
-    #[test]
-    fn the_tuning_file_is_atomic_and_removable() {
-        let dir = std::env::temp_dir().join(format!("hm-kws-tune-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(load_tuning(&dir).is_none(), "no file = the bundle default");
-        write_tuning(&dir, Some((0.18, 3.5))).unwrap();
-        assert_eq!(load_tuning(&dir), Some((0.18, 3.5)));
-        // Anything but a finite pair arms nothing.
-        std::fs::write(
-            dir.join("kw.tuning.json"),
-            r#"{"threshold":null,"score":3}"#,
-        )
-        .unwrap();
-        assert!(load_tuning(&dir).is_none());
-        write_tuning(&dir, Some((0.25, 3.0))).unwrap();
-        write_tuning(&dir, None).unwrap();
-        assert!(load_tuning(&dir).is_none(), "removed = back to the default");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The exit set is read from the deploy's own file; a missing or broken
-    /// file is "no local exit" (the core still closes the session), never a
-    /// half-armed vocabulary.
-    #[test]
-    fn the_exit_set_comes_from_the_deployed_file() {
-        let dir = std::env::temp_dir().join(format!("hm-kws-exit-read-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(load_exit_words(&dir).is_empty(), "no file = no local exit");
-
-        std::fs::write(
-            dir.join("kw.exit.json"),
-            r#"{"hash":"h1","words":["停止播放","退下"]}"#,
-        )
-        .unwrap();
-        let set = load_exit_words(&dir);
-        assert_eq!(set.len(), 2);
-        assert!(set.contains("退下"));
-
-        std::fs::write(dir.join("kw.exit.json"), "{not json").unwrap();
-        assert!(
-            load_exit_words(&dir).is_empty(),
-            "a broken file arms nothing"
-        );
-        std::fs::write(dir.join("kw.exit.json"), r#"{"hash":"h2","words":[]}"#).unwrap();
-        assert!(load_exit_words(&dir).is_empty(), "an empty set is no exit");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn vad_event_parses_and_tristate_decodes() {
-        assert_eq!(
-            parse_event_line(r#"{"event":"vad","speech":true}"#),
-            DriverEvent::Vad {
-                speech: true,
-                prob: None,
-            }
-        );
-        assert_eq!(
-            parse_event_line(r#"{"event":"vad","speech":false,"prob":0.12}"#),
-            DriverEvent::Vad {
-                speech: false,
-                prob: Some(0.12),
-            }
-        );
-        assert_eq!(
-            parse_event_line(r#"{"event":"vad"}"#),
-            DriverEvent::Unknown,
-            "missing boolean speech field must be ignored"
-        );
-        assert_eq!(decode_vad_state(VAD_UNKNOWN), None);
-        assert_eq!(decode_vad_state(VAD_SILENCE), Some(false));
-        assert_eq!(decode_vad_state(VAD_SPEECH), Some(true));
-    }
-}
+#[path = "kws_tests.rs"]
+mod tests;

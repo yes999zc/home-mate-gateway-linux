@@ -147,8 +147,6 @@ pub(super) fn capture_thread(
     seq: Arc<AtomicU64>,
     mut pipeline: Option<aec::Pipeline>,
     loopback_probe: bool,
-    mut probe: Option<ProbeSink>,
-    mut probe_mics: Option<ProbeSink>,
     kws_feed: Option<kws::KwsFeed>,
     barge: Option<Arc<std::sync::Mutex<bargein::Detector>>>,
     nearend: Arc<std::sync::Mutex<nearend::NearEndEvaluator>>,
@@ -156,6 +154,8 @@ pub(super) fn capture_thread(
     ok_ms: Arc<AtomicU64>,
 ) {
     pin_audio_thread("capture/aec");
+    let mut probe: Option<ProbeSink> = None;
+    let mut probe_mics: Option<ProbeSink> = None;
     let mut boot = boot;
     let frame_bytes = UPLINK_FRAMES as usize * CAP_CHANNELS * 3;
     let mut buf = vec![0u8; frame_bytes];
@@ -326,7 +326,7 @@ pub(super) fn capture_thread(
                     m.append_bytes(&bytes);
                 }
             }
-            let (cleaned_ref, ref_lock_all) = pipe.process(&decoded, &buf, &mut fused);
+            let (cleaned_ref, ref_lock_all) = pipe.process(&decoded, &mut fused);
             block_ref_locked = ref_lock_all;
             if !ref_lock_all {
                 degraded_ref_blocks += 1;
@@ -526,7 +526,16 @@ pub(super) fn capture_thread(
                     // per episode.
                     let voice_ms = now.saturating_sub(barge_voice_since.unwrap_or(now));
                     let local = {
+                        let now_wall = now_ms();
                         let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                        if sh.local_stop.as_ref().is_some_and(|(_, at)| {
+                            now_wall.saturating_sub(*at) >= LOCAL_FLUSH_LOCK_TIMEOUT_MS
+                        }) {
+                            fwlog!(
+                                "[barge-in] expiring stale local_stop marker (>= {LOCAL_FLUSH_LOCK_TIMEOUT_MS}ms)"
+                            );
+                            sh.local_stop = None;
+                        }
                         let trusted = *ref_lock_all && residual_db > -15.0;
                         let task = sh.active[0].as_ref().map(|(t, _)| t.clone());
                         let fresh = voice_ms >= cfg.barge_in_protect;
@@ -558,7 +567,7 @@ pub(super) fn capture_thread(
                         }
                         match (allowed, task) {
                             (true, Some(task)) => {
-                                sh.local_stop = Some((task.clone(), now_ms()));
+                                sh.local_stop = Some((task.clone(), now_wall));
                                 if let Some(tx) = sh.play_tx.as_ref() {
                                     sh.send_play(tx, PlayAction::Flush(Chan::Voice));
                                 }

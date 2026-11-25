@@ -130,7 +130,7 @@ impl Pipeline {
     /// be used for near-end decisions, even if the last frame relocked
     /// (2026-11-12: `stats().locked` sampled after the block hid exactly
     /// that loss+relock and the detector fired on a poisoned reference).
-    pub fn process(&mut self, block: &[[i16; 9]], raw: &[u8], out: &mut [i16]) -> (Vec<i16>, bool) {
+    pub fn process(&mut self, block: &[[i16; 9]], out: &mut [i16]) -> (Vec<i16>, bool) {
         let n = block.len();
         debug_assert_eq!(out.len(), n);
         let mut ref_all = Vec::with_capacity(n);
@@ -145,15 +145,7 @@ impl Pipeline {
             let cleaned = if self.direct_clean_ref {
                 raw_ref
             } else {
-                // Raw S24 bytes of channel 8 (bytes 24..27 of each 27-byte
-                // frame), for the dealias encoder probe.
-                let ref_bytes: Vec<u8> = raw[f * FRAME * 27..(f + 1) * FRAME * 27]
-                    .as_chunks::<27>()
-                    .0
-                    .iter()
-                    .flat_map(|fr| fr[24..27].iter().copied())
-                    .collect();
-                let cleaned_ref = self.ref_cleaner.clean(&raw_ref, &ref_bytes);
+                let cleaned_ref = self.ref_cleaner.clean(&raw_ref);
                 if cleaned_ref.state != dealias::LockState::Locked {
                     lock_all = false;
                 }

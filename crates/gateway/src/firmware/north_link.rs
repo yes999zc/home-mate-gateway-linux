@@ -152,17 +152,8 @@ pub(super) async fn north_connect_and_serve(
     result
 }
 
-pub(super) async fn serve_link(
-    role: &Role,
-    rd: tokio::net::tcp::OwnedReadHalf,
-    mut wr: tokio::net::tcp::OwnedWriteHalf,
-    tx: NorthTx,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _activity = role
-        .northbound_stats
-        .activity(northbound::ActivityKind::Reader);
-    let mut lines = BufReader::new(rd);
-    let hello = GatewayFrame::Hello {
+pub(super) fn build_hello_frame(role: &Role) -> GatewayFrame {
+    GatewayFrame::Hello {
         protocol: PROTOCOL_VERSION,
         min_protocol: PROTOCOL_MIN_VERSION,
         supported_versions: crate::protocol::SUPPORTED_PROTOCOLS.to_vec(),
@@ -173,10 +164,25 @@ pub(super) async fn serve_link(
         ),
         gateway_version: role.cfg.version.clone(),
         aec_tail_ms: crate::protocol::aec_tail_ms(role.cfg.aec, role.cfg.aec_tail),
-        profile_version: Some(crate::protocol::PROFILE_VERSION.to_string()),
-        auth_token: None,
+        profile_version: Some(
+            crate::protocol::profile_version_for_model(&role.cfg.profile.model).to_string(),
+        ),
+        auth_token: role.cfg.auth_token.clone(),
         devices: vec![role.descriptor()],
-    };
+    }
+}
+
+pub(super) async fn serve_link(
+    role: &Role,
+    rd: tokio::net::tcp::OwnedReadHalf,
+    mut wr: tokio::net::tcp::OwnedWriteHalf,
+    tx: NorthTx,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let _activity = role
+        .northbound_stats
+        .activity(northbound::ActivityKind::Reader);
+    let mut lines = BufReader::new(rd);
+    let hello = build_hello_frame(role);
     if let Err(error) = northbound::write_handshake(&mut wr, &hello, &role.northbound_stats).await {
         tx.fail(northbound::write_error_reason(&error));
         return Err(error.into());
@@ -260,11 +266,17 @@ pub(super) async fn serve_link(
         sh.link_gen = sh.link_gen.wrapping_add(1);
         let link_gen = sh.link_gen;
         sh.north_tx = Some(tx.clone());
-        let descriptor = role.descriptor();
         let volume_level = sh.volume;
         let mic_on = sh.mic_on;
         let muted = sh.muted;
+        let duplex_requested = if sh.duplex_requested.is_empty() {
+            sh.duplex_effective.clone()
+        } else {
+            sh.duplex_requested.clone()
+        };
+        let duplex_effective = sh.duplex_effective.clone();
         drop(sh);
+        let descriptor = role.descriptor();
         tx.send_ctrl(GatewayFrame::DeviceStatus {
             device: role.cfg.device_id.clone(),
             online: true,
@@ -272,6 +284,7 @@ pub(super) async fn serve_link(
             descriptor: Some(descriptor),
             northbound: None,
         });
+        tx.send_ctrl(role.mode_report_frame(duplex_requested, duplex_effective));
         // Keyword reflex truth on every (re)connect: a core that restarted
         // must not guess whether the spotter is alive.
         let status = {

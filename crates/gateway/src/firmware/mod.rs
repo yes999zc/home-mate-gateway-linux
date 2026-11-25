@@ -69,6 +69,7 @@ use capture::capture_thread;
 pub use capture::{decode_s24_3le, downmix_block};
 use keywords::deploy_keywords;
 use north::render_ring;
+pub use north_config::KWS_RELOAD_TIMEOUT_MS;
 use north_link::{north_loop, ProtocolMismatch};
 use northbound::NorthTx;
 use playback::{
@@ -92,10 +93,13 @@ use tokio::sync::mpsc;
 #[cfg(test)]
 pub(crate) use wifi::wifi_credentials_rejected;
 use wifi::{load_state, save_state, spawn_wifi_probe};
-pub use wire::{block_dbfs, rss_kb, RSS_LIMIT_KB, RSS_WARN_KB};
 use wire::{
-    check_rss_budget, flush_outcome, local_stop_allowed, pin_audio_thread, probe_armed,
-    stream_task_of, FlushOutcome, LocalExit, ProbeSink,
+    auth_token_from_env, check_rss_budget, flush_outcome, local_stop_allowed, pin_audio_thread,
+    probe_armed, stream_task_of, FlushOutcome, LocalExit, ProbeSink,
+};
+pub use wire::{
+    block_dbfs, core_addr_allowed, core_addr_is_loopback, core_addr_is_private_lan, rss_kb,
+    RSS_LIMIT_KB, RSS_WARN_KB,
 };
 pub(crate) use wire::{fnv1a_hex, LevelWindow};
 #[cfg(test)]
@@ -142,6 +146,10 @@ const DEFAULT_BARGE_PROTECT_MS: u64 = 800;
 /// core's own handling, while staying far below a normal turn so a stale
 /// marker cannot eat a legitimate later play.
 const LOCAL_STOP_BLOCK_MS: u64 = 10_000;
+/// Bounded max age (ms) for an in-flight `local_exit` or `local_stop` slot
+/// awaiting `FlushDone`. Guarantees no lost or superseded flush can ever lock
+/// future retreat-word exits or local barge-in stops indefinitely.
+const LOCAL_FLUSH_LOCK_TIMEOUT_MS: u64 = 2_000;
 /// Default bounded timeout for local Wi-Fi provisioning mode (#23): 180 s.
 pub const DEFAULT_WIFI_PROVISIONING_TIMEOUT_MS: u64 = 180_000;
 
@@ -149,6 +157,14 @@ pub const DEFAULT_WIFI_PROVISIONING_TIMEOUT_MS: u64 = 180_000;
 pub struct FirmwareConfig {
     /// Northbound core LDJSON address (loopback once the core is on-device).
     pub core_addr: String,
+    /// Opt-in flag (`--allow-lan-core`) permitting private LAN/Tailscale/ULA
+    /// `core_addr` hosts for thin-gateway deployments (e.g. 128 MB LX06).
+    /// Loopback-only remains the default; public internet IPs are always rejected.
+    pub allow_lan_core: bool,
+    /// Optional pairing/admin bearer token sent in `Hello.auth_token` when
+    /// authenticating against a LAN/Tailscale core (from `--auth-token`,
+    /// `HM_CORE_AUTH_TOKEN`, or `HM_GATEWAY_AUTH_TOKEN`).
+    pub auth_token: Option<String>,
     /// v1 mechanism (#11/#12): does THIS build declare the `wifi`
     /// capability (a radio is present)? A form without one must NOT execute
     /// a WifiConfig frame — the privileged-frame gate turns it into a
@@ -296,6 +312,10 @@ pub struct FirmwareConfig {
     pub led_orientation: leds::LedOrientation,
     /// Bounded timeout for local Wi-Fi provisioning mode (#23).
     pub wifi_provisioning_timeout_ms: u64,
+    /// Bounded wait (monotonic ms) for a restarted `hm-kws` sidecar to emit
+    /// `ready` after `ConfigApply(Kws)`. Defaults to [`KWS_RELOAD_TIMEOUT_MS`]
+    /// (20_000 ms); `0` falls back to the default.
+    pub kws_reload_timeout_ms: u64,
 }
 
 impl Default for FirmwareConfig {
@@ -303,6 +323,8 @@ impl Default for FirmwareConfig {
         let profile = profile::DeviceProfile::default();
         Self {
             core_addr: "127.0.0.1:8932".into(),
+            allow_lan_core: false,
+            auth_token: auth_token_from_env(),
             // dot2-direct carries a radio; a radio-less form flips this off.
             wifi: true,
             device_id: profile.unit_id.clone(),
@@ -359,6 +381,7 @@ impl Default for FirmwareConfig {
             night_mode: leds::NightMode::default(),
             led_orientation: leds::LedOrientation::default(),
             wifi_provisioning_timeout_ms: DEFAULT_WIFI_PROVISIONING_TIMEOUT_MS,
+            kws_reload_timeout_ms: KWS_RELOAD_TIMEOUT_MS,
         }
     }
 }
@@ -706,20 +729,3 @@ pub enum Chan {
 /// now admits a 3-minute answer: 180 s at 48k mono i16 ≈ 17 MB pending, still
 /// small against this device's memory and bounded per channel.
 const STREAM_AHEAD_LIMIT: u64 = 180 * 48_000;
-
-/// The shipping link is the core on this same speaker. Accept only a
-/// loopback socket (`127.0.0.1`, `::1`, or the name `localhost`).
-pub fn core_addr_is_loopback(addr: &str) -> bool {
-    let addr = addr.trim();
-    if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
-        return sa.ip().is_loopback();
-    }
-    let Some((host, port)) = addr.rsplit_once(':') else {
-        return false;
-    };
-    if port.parse::<u16>().is_err() {
-        return false;
-    }
-    let host = host.trim_matches(|c| c == '[' || c == ']');
-    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
-}

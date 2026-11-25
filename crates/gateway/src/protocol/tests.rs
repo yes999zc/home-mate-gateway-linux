@@ -380,7 +380,12 @@ fn hello_carries_aec_tail_and_profile_version_with_backward_compat() {
     assert_eq!(aec_tail_ms(true, 2560), Some(160));
     assert_eq!(aec_tail_ms(true, 10240), Some(640));
     assert_eq!(aec_tail_ms(false, 10240), None);
+    #[cfg(all(feature = "board-lx06", not(feature = "board-dot2")))]
+    assert_eq!(PROFILE_VERSION, "lx06-array-v1");
+    #[cfg(not(all(feature = "board-lx06", not(feature = "board-dot2"))))]
     assert_eq!(PROFILE_VERSION, "dot2-array-postaec-v1");
+    assert_eq!(profile_version_for_model("LX06"), "lx06-array-v1");
+    assert_eq!(profile_version_for_model("AEOBC"), PROFILE_VERSION);
 
     let hello = GatewayFrame::Hello {
         protocol: PROTOCOL_VERSION,

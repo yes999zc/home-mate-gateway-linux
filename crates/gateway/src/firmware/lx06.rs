@@ -445,7 +445,7 @@ enum Playback {
     Shared(pcm::SharedPlayback),
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndicatorOwner {
     Home,
     Idle,
@@ -708,6 +708,49 @@ impl Hardware for Lx06Hardware {
     fn wake_lock(&self) -> io::Result<()> {
         Ok(())
     }
+}
+
+#[cfg(test)]
+pub(super) fn test_shared_hardware_from_cat() -> Arc<dyn Hardware> {
+    struct SharedCatHw(Mutex<pcm::SharedPlayback>);
+    impl Hardware for SharedCatHw {
+        fn capture_read(&self, _: &mut [u8], _: u32) -> io::Result<u32> {
+            Ok(0)
+        }
+        fn playback_write(&self, stereo: &[i16], frames: u32) -> io::Result<u32> {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(stereo.as_ptr().cast::<u8>(), stereo.len() * 2)
+            };
+            self.0.lock().unwrap().write(bytes, frames)
+        }
+        fn playback_flush(&self) -> io::Result<()> {
+            self.0.lock().unwrap().flush()
+        }
+        fn playback_drain(&self) -> io::Result<()> {
+            self.0.lock().unwrap().drain()
+        }
+        fn playback_releases_when_idle(&self) -> bool {
+            true
+        }
+        fn playback_underruns(&self) -> u64 {
+            0
+        }
+        fn playback_delay_frames(&self) -> Option<u64> {
+            None
+        }
+        fn led_write(&self, _: &[(u8, u8, u8); leds::RING_LEDS]) -> io::Result<()> {
+            Ok(())
+        }
+        fn button_next(&self) -> io::Result<ButtonEvent> {
+            Err(io::Error::other("test"))
+        }
+        fn wake_lock(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    Arc::new(SharedCatHw(Mutex::new(
+        pcm::SharedPlayback::from_cat_for_test(),
+    )))
 }
 
 #[cfg(test)]

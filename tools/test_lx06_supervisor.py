@@ -42,6 +42,9 @@ class TestSupervisor(unittest.TestCase):
         unxz = self.flash / "unxz"
         unxz.write_text('#!/bin/sh\necho unpack >> "$FIXTURE/count"\nexec xz -dc\n')
         unxz.chmod(0o755)
+        self.meminfo = self.root / "meminfo"
+        # Default 256 MB LX06 unit (~241 MiB MemTotal) so existing tests stay on full mode.
+        self.meminfo.write_text("MemTotal:         246784 kB\nMemFree:          120000 kB\n")
         # Exercise the shipped function bodies. Replace just the boot invocation
         # and board service/process discovery at the host fixture boundary.
         body, launch, tail = SUPERVISOR.read_text().rpartition("\nrun_supervisor &")
@@ -57,8 +60,10 @@ NATIVE_LOG_DIR="$FIXTURE/native-journal"
 WD_LOG="$FIXTURE/wd"
 CORE_LOG="$FIXTURE/core"
 GW_LOG="$FIXTURE/gateway"
+MEMINFO_FILE="$FIXTURE/meminfo"
 start_native_services() { echo "native $*" >> "$FIXTURE/services"; }
 stop_runtime() { echo "stop $*" >> "$FIXTURE/services"; }
+stop_core() { echo "stop hm-core" >> "$FIXTURE/services"; }
 runtime_pid() { return 1; }
 pidof() { [ "$1" = mipns-xiaomi ] && [ -f "$FIXTURE/pns-live" ]; }
 pns_service() {
@@ -92,7 +97,10 @@ wait
         starts = (self.root / "starts").read_text().splitlines()
         self.assertEqual(sum(s.startswith("hm-gateway 1 firmware ") for s in starts), 2)
         self.assertEqual(sum("lx06-switch-watch" in s for s in starts), 1)
-        self.assertIn("pns start", (self.root / "services").read_text().splitlines())
+        services = (self.root / "services").read_text().splitlines()
+        self.assertIn("pns start", services)
+        self.assertIn("stop firmware", services)
+        self.assertIn("stop hm-core", services)
         self.assertTrue((self.flash / "state/models/silero_vad.onnx").is_file())
 
     def test_cold_start_enables_the_bundled_gateway_vad_model(self):
@@ -276,6 +284,330 @@ start_native_services
                 "mico_aivs_lab start",
             ],
         )
+
+    def test_thin_mode_flag_with_thin_bundle_skips_core_and_kws(self):
+        (self.flash / "thin-mode").write_text("")
+        (self.flash / "kws.url").unlink()
+        (self.flash / "kws.sha256").unlink()
+        gateway = STUB + b'printf "%s|%s" "${KWS_VAD_MODEL:-}" "${HM_CORE_AUTH_TOKEN:-}" > "$FIXTURE/thin-env"\n'
+        archive(self.flash / "hm-bundle.tar.xz", {"hm-gateway": gateway})
+        result = self.run_shell("supervise_tick; wait")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        starts = (self.root / "starts").read_text().splitlines()
+        self.assertEqual(len(starts), 1)
+        self.assertTrue(starts[0].startswith("hm-gateway 1 firmware "), starts[0])
+        self.assertIn("--core 127.0.0.1:8932", starts[0])
+        self.assertNotIn("--allow-lan-core", starts[0])
+        self.assertNotIn("--kws", starts[0])
+        self.assertFalse(any(s.startswith("hm-core ") for s in starts))
+        self.assertFalse((self.root / "hm/hm-core").exists())
+        self.assertFalse((self.root / "hm-kws").exists())
+        self.assertEqual((self.root / "thin-env").read_text(), "|")
+
+    def test_thin_mode_with_full_bundle_strips_core_and_web_and_reuses_cache(self):
+        (self.flash / "thin-mode").write_text("")
+        (self.flash / "kws.url").unlink()
+        (self.flash / "kws.sha256").unlink()
+        archive(self.flash / "hm-bundle.tar.xz", {
+            "hm-core": STUB,
+            "hm-gateway": STUB,
+            "silero_vad.onnx": b"fixture",
+            "web/index.html": b"<html></html>",
+        })
+        result = self.run_shell("supervise_tick; wait; supervise_tick; wait")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "count").read_text().splitlines(), ["unpack"])
+        self.assertTrue((self.root / "hm/hm-gateway").is_file())
+        self.assertFalse((self.root / "hm/hm-core").exists())
+        self.assertFalse((self.root / "hm/web").exists())
+        self.assertFalse((self.root / "hm/silero_vad.onnx").exists())
+        starts = (self.root / "starts").read_text().splitlines()
+        self.assertEqual(len(starts), 2)
+        for line in starts:
+            self.assertTrue(line.startswith("hm-gateway 1 firmware "), line)
+            self.assertNotIn("--kws", line)
+
+    def test_thin_mode_reads_lan_core_addr_and_token_via_env(self):
+        (self.flash / "thin-mode").write_text("")
+        (self.flash / "kws.url").unlink()
+        (self.flash / "kws.sha256").unlink()
+        (self.flash / "core.addr").write_text("192.168.1.50:8932\n")
+        token_file = self.flash / "core.token"
+        token_file.write_text("hm1_lan_secret_token\n")
+        token_file.chmod(0o644)
+        gateway = STUB + b'printf "%s" "${HM_CORE_AUTH_TOKEN:-}" > "$FIXTURE/gw-token"\n'
+        archive(self.flash / "hm-bundle.tar.xz", {"hm-gateway": gateway})
+        result = self.run_shell("supervise_tick; wait")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        starts = (self.root / "starts").read_text().splitlines()
+        self.assertEqual(len(starts), 1)
+        self.assertIn("--core 192.168.1.50:8932", starts[0])
+        self.assertIn("--allow-lan-core", starts[0])
+        self.assertNotIn("hm1_lan_secret_token", starts[0])
+        self.assertNotIn("--kws", starts[0])
+        self.assertEqual((self.root / "gw-token").read_text(), "hm1_lan_secret_token")
+        self.assertEqual(token_file.stat().st_mode & 0o777, 0o600)
+
+    def test_thin_mode_auto_detected_from_128mb_meminfo(self):
+        # 128 MB LX06 batch measures MemTotal ~ 118,760 kB (< 180,000 kB threshold).
+        self.meminfo.write_text("MemTotal:         118760 kB\nMemFree:           41200 kB\n")
+        (self.flash / "kws.url").unlink()
+        (self.flash / "kws.sha256").unlink()
+        archive(self.flash / "hm-bundle.tar.xz", {"hm-gateway": STUB})
+        result = self.run_shell("supervise_tick; wait")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        starts = (self.root / "starts").read_text().splitlines()
+        self.assertEqual(len(starts), 1)
+        self.assertTrue(starts[0].startswith("hm-gateway 1 firmware "), starts[0])
+        self.assertIn("--core 127.0.0.1:8932", starts[0])
+        self.assertNotIn("--kws", starts[0])
+        self.assertFalse(any(s.startswith("hm-core ") for s in starts))
+
+    def test_thin_mode_env_override_supports_xiaoai_pin_and_cache_reuse(self):
+        (self.flash / "kws.url").unlink()
+        (self.flash / "kws.sha256").unlink()
+        archive(self.flash / "hm-bundle.tar.xz", {"hm-gateway": STUB})
+        result = self.run_shell("""
+HM_THIN_MODE=1
+export HM_THIN_MODE
+supervise_tick
+wait
+printf 'xiaoai-pinned\\n' > "$HM_FLASH_DIR/mode"
+supervise_tick
+wait
+printf 'homemate\\n' > "$HM_FLASH_DIR/mode"
+supervise_tick
+wait
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "count").read_text().splitlines(), ["unpack"])
+        starts = (self.root / "starts").read_text().splitlines()
+        self.assertEqual(sum(s.startswith("hm-gateway 1 firmware ") for s in starts), 2)
+        self.assertEqual(sum("lx06-switch-watch" in s for s in starts), 1)
+        self.assertFalse(any(s.startswith("hm-core ") for s in starts))
+
+    def test_custom_device_id_honored_in_both_256mb_and_thin_modes(self):
+        # 1. 256 MB full mode passes custom device-id + --model LX06 + --kws.
+        state_dir = self.flash / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "device-id").write_text("lx06-bedroom\n")
+        r_full = self.run_shell("supervise_tick; wait")
+        self.assertEqual(r_full.returncode, 0, r_full.stderr)
+        full_starts = (self.root / "starts").read_text().splitlines()
+        gw_full = [s for s in full_starts if s.startswith("hm-gateway 1 firmware ")]
+        self.assertEqual(len(gw_full), 1)
+        self.assertIn("--device-id lx06-bedroom --model LX06", gw_full[0])
+        self.assertIn("--kws", gw_full[0])
+
+        # 2. 128 MB thin mode passes custom device-id + --model LX06 without --kws.
+        (self.root / "starts").unlink()
+        (self.flash / "thin-mode").write_text("")
+        (state_dir / "device-id").write_text("lx06-study\n")
+        r_thin = self.run_shell("supervise_tick; wait")
+        self.assertEqual(r_thin.returncode, 0, r_thin.stderr)
+        thin_starts = (self.root / "starts").read_text().splitlines()
+        gw_thin = [s for s in thin_starts if s.startswith("hm-gateway 1 firmware ")]
+        self.assertEqual(len(gw_thin), 1)
+        self.assertIn("--device-id lx06-study --model LX06", gw_thin[0])
+        self.assertNotIn("--kws", gw_thin[0])
+
+    def test_thin_mode_loopback_vs_lan_and_ipv6_ula_allow_lan_core_flag(self):
+        (self.flash / "thin-mode").write_text("")
+        (self.flash / "kws.url").unlink()
+        (self.flash / "kws.sha256").unlink()
+        archive(self.flash / "hm-bundle.tar.xz", {"hm-gateway": STUB})
+        cases = [
+            ("127.0.0.1:8932", False),
+            ("localhost:8932", False),
+            ("[::1]:8932", False),
+            ("[::ffff:127.0.0.1]:8932", False),
+            ("192.168.1.50:8932", True),
+            ("[fd7a:115c:a1e0::1]:8932", True),
+        ]
+        for addr, expect_lan_flag in cases:
+            if (self.root / "starts").exists():
+                (self.root / "starts").unlink()
+            (self.flash / "core.addr").write_text(f"{addr}\n")
+            res = self.run_shell("supervise_tick; wait")
+            self.assertEqual(res.returncode, 0, f"{addr}: {res.stderr}")
+            starts = (self.root / "starts").read_text().splitlines()
+            self.assertEqual(len(starts), 1, f"{addr}: {starts}")
+            self.assertIn(f"--core {addr}", starts[0])
+            if expect_lan_flag:
+                self.assertIn("--allow-lan-core", starts[0], f"{addr} must pass --allow-lan-core")
+            else:
+                self.assertNotIn("--allow-lan-core", starts[0], f"{addr} must omit --allow-lan-core")
+
+    def test_xiaoai_pinned_stops_running_hm_core_to_reclaim_ram(self):
+        body, launch, tail = SUPERVISOR.read_text().rpartition("\nrun_supervisor &")
+        assert launch and not tail.strip()
+        script = body + """
+PATH="$HOST_BIN_PATH"
+HM_FLASH_DIR="$FIXTURE/flash"
+HM_STATE_DIR="$HM_FLASH_DIR/state"
+HM_RUN_DIR="$FIXTURE/hm"
+KWS_DIR="$FIXTURE/hm-kws"
+NATIVE_MUTE="$FIXTURE/mute"
+NATIVE_LOG_DIR="$FIXTURE/native-journal"
+WD_LOG="$FIXTURE/wd"
+CORE_LOG="$FIXTURE/core"
+GW_LOG="$FIXTURE/gateway"
+MEMINFO_FILE="$FIXTURE/meminfo"
+start_native_services() { :; }
+stop_runtime() { :; }
+runtime_pid() { return 1; }
+pns_service() { :; }
+sleep 30 &
+CORE_PID=$!
+pidof() {
+    if [ "$1" = hm-core ] && kill -0 "$CORE_PID" 2>/dev/null; then
+        echo "$CORE_PID"
+        return 0
+    fi
+    return 1
+}
+last_mode="homemate"
+init_state_if_needed
+printf 'xiaoai-pinned\\n' > "$HM_FLASH_DIR/mode"
+supervise_tick
+wait "$CORE_PID" 2>/dev/null || true
+if kill -0 "$CORE_PID" 2>/dev/null; then
+    echo "hm-core still alive" >&2
+    exit 9
+fi
+wait 2>/dev/null || true
+"""
+        r = subprocess.run(
+            ["sh", "-eu"], input=script, text=True,
+            env={**os.environ, "FIXTURE": str(self.root), "HOST_BIN_PATH": os.environ["PATH"]},
+            capture_output=True, timeout=15,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_thin_mode_extracts_only_hm_gateway_member_without_spiking_tmpfs(self):
+        (self.flash / "thin-mode").write_text("")
+        (self.flash / "kws.url").unlink()
+        (self.flash / "kws.sha256").unlink()
+        archive(self.flash / "hm-bundle.tar.xz", {
+            "hm-core": b"BIG_CORE_PAYLOAD" * 1024,
+            "hm-gateway": STUB,
+            "silero_vad.onnx": b"VAD_BYTES" * 1024,
+            "web/index.html": b"<html></html>",
+        })
+        result = self.run_shell("""
+tar() {
+    printf '%s\\n' "$*" >> "$FIXTURE/tar-args"
+    command tar "$@"
+}
+supervise_tick
+wait
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tar_calls = (self.root / "tar-args").read_text().splitlines()
+        self.assertEqual(len(tar_calls), 1)
+        self.assertTrue(
+            tar_calls[0].endswith(" hm-gateway"),
+            f"thin mode must extract only hm-gateway member, got: {tar_calls[0]}",
+        )
+        self.assertTrue((self.root / "hm/hm-gateway").is_file())
+        self.assertFalse((self.root / "hm/hm-core").exists())
+        self.assertFalse((self.root / "hm/web").exists())
+        self.assertFalse((self.root / "hm/silero_vad.onnx").exists())
+
+    def test_sync_kws_config_is_atomic_skips_unchanged_and_does_not_resurrect_deleted(self):
+        result = self.run_shell("""
+mkdir -p "$KWS_DIR" "$HM_STATE_DIR/kws-persist"
+printf 'n i h ao @你好\\n' > "$HM_STATE_DIR/kws-persist/kw.txt"
+printf '{"threshold":0.25,"score":3.0}\\n' > "$HM_STATE_DIR/kws-persist/kw.tuning.json"
+
+# 1. Initial restore copies persisted files into fresh KWS_DIR once.
+restore_kws_config
+cmp -s "$HM_STATE_DIR/kws-persist/kw.txt" "$KWS_DIR/kw.txt"
+cmp -s "$HM_STATE_DIR/kws-persist/kw.tuning.json" "$KWS_DIR/kw.tuning.json"
+
+# 2. Steady-state sync skips cp when unchanged (zero flash writes).
+cp() {
+    printf 'cp %s -> %s\\n' "$1" "$2" >> "$FIXTURE/cp-log"
+    command cp "$@"
+}
+mv() {
+    printf 'mv %s\\n' "$*" >> "$FIXTURE/mv-log"
+    command mv "$@"
+}
+sync_kws_config
+test ! -e "$FIXTURE/cp-log"
+test ! -e "$FIXTURE/mv-log"
+
+# 3. Changed live file writes atomically via .tmp + mv -f.
+printf 'n i h ao @你好小智\\n' > "$KWS_DIR/kw.txt"
+sync_kws_config
+grep -q "kws-persist/kw.txt.tmp$" "$FIXTURE/cp-log"
+grep -q "kws-persist/kw.txt.tmp .*kws-persist/kw.txt$" "$FIXTURE/mv-log"
+test ! -e "$HM_STATE_DIR/kws-persist/kw.txt.tmp"
+cmp -s "$KWS_DIR/kw.txt" "$HM_STATE_DIR/kws-persist/kw.txt"
+
+# 4. Intentionally deleted live file (e.g. tuning reset) is NOT resurrected
+#    from flash on steady-state ticks, and its stale flash copy is removed.
+rm -f "$KWS_DIR/kw.tuning.json"
+sync_kws_config
+test ! -e "$KWS_DIR/kw.tuning.json"
+test ! -e "$HM_STATE_DIR/kws-persist/kw.tuning.json"
+
+# 5. Subsequent restore_kws_config after initial marker does not overwrite live.
+printf 'keep-live\\n' > "$KWS_DIR/kw.txt"
+restore_kws_config
+grep -qx 'keep-live' "$KWS_DIR/kw.txt"
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_sync_kws_config_handles_enospc_and_write_failures_with_backoff(self):
+        result = self.run_shell("""
+mkdir -p "$KWS_DIR" "$HM_STATE_DIR/kws-persist"
+printf 'old-good-kw\\n' > "$HM_STATE_DIR/kws-persist/kw.txt"
+printf 'new-kw-v2\\n' > "$KWS_DIR/kw.txt"
+
+# 1. Low free space skips write, preserves existing flash file, and arms backoff (5s).
+flash_free_kb() { echo 12; }
+cp() {
+    echo "cp_called" >> "$FIXTURE/writes"
+    command cp "$@"
+}
+if sync_kws_config; then exit 9; fi
+test ! -e "$FIXTURE/writes"
+grep -qx 'old-good-kw' "$HM_STATE_DIR/kws-persist/kw.txt"
+test "$kws_sync_fail_streak" -eq 1
+test "$kws_sync_cooldown" -eq 5
+
+# 2. During cooldown ticks, sync_kws_config returns 0 without retrying flash.
+flash_free_kb() { echo 4096; }
+for _i in 1 2 3 4 5; do
+    sync_kws_config
+done
+test ! -e "$FIXTURE/writes"
+test "$kws_sync_cooldown" -eq 0
+
+# 3. Simulated cp failure mid-write cleans up partial .tmp, keeps old file intact,
+#    and doubles backoff (streak=2 -> 10s).
+cp() {
+    echo "cp_fail" >> "$FIXTURE/writes"
+    printf 'partial' > "$2"
+    return 1
+}
+if sync_kws_config; then exit 9; fi
+test ! -e "$HM_STATE_DIR/kws-persist/kw.txt.tmp"
+grep -qx 'old-good-kw' "$HM_STATE_DIR/kws-persist/kw.txt"
+test "$kws_sync_fail_streak" -eq 2
+test "$kws_sync_cooldown" -eq 10
+
+# 4. Once cooldown expires and writes succeed, streak resets and new file persists.
+kws_sync_cooldown=0
+cp() { command cp "$@"; }
+sync_kws_config
+test "$kws_sync_fail_streak" -eq 0
+test "$kws_sync_cooldown" -eq 0
+grep -qx 'new-kw-v2' "$HM_STATE_DIR/kws-persist/kw.txt"
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

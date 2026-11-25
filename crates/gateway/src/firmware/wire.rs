@@ -90,6 +90,10 @@ pub(super) struct LocalExit {
     pub(super) music_task: Option<String>,
     /// First flush failure seen, if any (the audio may still be live).
     pub(super) flush_err: Option<String>,
+    /// Deferred retreat `Keyword` frame held until `FlushDone` (or bounded
+    /// settlement) emits `LocalExitFlushed`, guaranteeing `LocalExitFlushed`
+    /// arrives at Core strictly BEFORE `Keyword` closes the session.
+    pub(super) deferred_keyword: Option<GatewayFrame>,
 }
 
 impl LocalExit {
@@ -445,4 +449,95 @@ pub fn block_dbfs(block: &[i16]) -> f32 {
     } else {
         (20.0 * rms.log10()) as f32
     }
+}
+
+/// The default shipping link is the core on this same speaker. Accept only a
+/// loopback socket (`127.0.0.1`, `::1`, IPv4-mapped loopback, or `localhost`)
+/// with a non-zero port.
+pub fn core_addr_is_loopback(addr: &str) -> bool {
+    let addr = addr.trim();
+    if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+        if sa.port() == 0 {
+            return false;
+        }
+        return match sa.ip() {
+            std::net::IpAddr::V4(v4) => v4.is_loopback(),
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+            }
+        };
+    }
+    let Some((host, port)) = addr.rsplit_once(':') else {
+        return false;
+    };
+    if !port.parse::<u16>().is_ok_and(|p| p != 0) {
+        return false;
+    }
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+fn is_private_lan_ipv4(v4: std::net::Ipv4Addr) -> bool {
+    let [a, b, _, _] = v4.octets();
+    a == 10
+        || (a == 192 && b == 168)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 100 && (64..=127).contains(&b))
+}
+
+/// True iff `addr` is a numeric `IP:port` (port > 0) pointing to a private LAN
+/// host: RFC 1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), Tailscale
+/// CGNAT (`100.64.0.0/10`), IPv4-mapped IPv6 of those ranges, or IPv6 ULA
+/// (`fc00::/7`, including Tailscale IPv6). Always rejects public internet IPs,
+/// link-local, multicast, unspecified addresses, and arbitrary DNS hostnames.
+pub fn core_addr_is_private_lan(addr: &str) -> bool {
+    let addr = addr.trim();
+    let Ok(sa) = addr.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    if sa.port() == 0 {
+        return false;
+    }
+    match sa.ip() {
+        std::net::IpAddr::V4(v4) => is_private_lan_ipv4(v4),
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                is_private_lan_ipv4(v4)
+            } else {
+                (v6.segments()[0] & 0xfe00) == 0xfc00
+            }
+        }
+    }
+}
+
+/// Validate a firmware `--core` target. Loopback is always permitted; private
+/// LAN/Tailscale/ULA IP:port addresses require explicit `--allow-lan-core`.
+pub fn core_addr_allowed(addr: &str, allow_lan: bool) -> bool {
+    core_addr_is_loopback(addr) || (allow_lan && core_addr_is_private_lan(addr))
+}
+
+pub(crate) fn normalize_auth_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+pub(crate) fn resolve_auth_token_from_lookup(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<String> {
+    for key in ["HM_CORE_AUTH_TOKEN", "HM_GATEWAY_AUTH_TOKEN"] {
+        if let Some(val) = lookup(key) {
+            if let Some(tok) = normalize_auth_token(&val) {
+                return Some(tok);
+            }
+        }
+    }
+    None
+}
+
+pub(super) fn auth_token_from_env() -> Option<String> {
+    resolve_auth_token_from_lookup(|key| std::env::var(key).ok())
 }

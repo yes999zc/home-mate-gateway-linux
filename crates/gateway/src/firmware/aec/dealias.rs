@@ -33,9 +33,6 @@ const TOL: i32 = 2;
 const MIN_MATCH: usize = 64;
 const MAX_MISSES: usize = 3;
 const BACKOFF: u32 = 30; // batches to skip after repeated loud misses
-/// Verbose miss diagnostics (candidates/pairs/raw bytes). Flip for field
-/// debugging; leave off in production logs.
-const MISS_DEBUG: bool = false;
 
 struct Ring {
     buf: Vec<i16>, // 48kHz left channel
@@ -108,6 +105,7 @@ pub struct Dealias {
     stats: Mutex<Stats>,
 }
 
+#[cfg(test)]
 fn at(ring: &Ring, i: i64) -> i16 {
     ring.buf[((i % RING as i64) + RING as i64) as usize % RING]
 }
@@ -239,7 +237,7 @@ impl Dealias {
     /// sample of this block came from a verified ring match.
     ///
     /// Interior-mutable: the playback thread holds the same Arc and feeds.
-    pub fn clean(&self, r: &[i16], r_bytes: &[u8]) -> CleanedRef {
+    pub fn clean(&self, r: &[i16]) -> CleanedRef {
         let n = r.len();
         if r.iter().all(|&s| s == 0) {
             // Zero ch8 is not proof of DAC silence. Keep the relock cursor
@@ -319,94 +317,6 @@ impl Dealias {
         let mut inner = self.inner.lock().unwrap();
         if !ok {
             if loud {
-                // Per-backoff diagnostic: anchor like the search does
-                // (first loud ref sample), then for the first few ring
-                // candidates report the prefix agreement length and the
-                // sample diff at the first mismatch — "off by 1 LSB" vs
-                // "scaled" vs "wrong channel" vs "not there" at a glance.
-                if MISS_DEBUG {
-                    if let Some(i0) = r.iter().position(|s| s.abs() > 64) {
-                        let ring = self.ring.lock().unwrap();
-                        let head = ring.head;
-                        let n = r.len();
-                        let r0 = r[i0] as i32;
-                        let lo = (head - RING as i64).max(0);
-                        let mut shown = 0;
-                        let mut candidates = 0;
-                        let mut best_prefix = 0usize;
-                        let mut j = head - 1;
-                        while j >= lo && shown < 3 {
-                            if (at(&ring, j) as i32 - r0).abs() <= TOL {
-                                candidates += 1;
-                                let p = j - 3 * i0 as i64;
-                                let mut k = 0usize;
-                                while i0 + k < n {
-                                    let pos = p + 3 * (i0 + k) as i64;
-                                    if pos < 0 || pos >= head {
-                                        break;
-                                    }
-                                    if (r[i0 + k] as i32 - at(&ring, pos) as i32).abs() > TOL {
-                                        break;
-                                    }
-                                    k += 1;
-                                }
-                                best_prefix = best_prefix.max(k);
-                                if k > 2 {
-                                    let pos = p + 3 * (i0 + k) as i64;
-                                    let diff = if pos >= 0 && pos < head {
-                                        r[i0 + k] as i32 - at(&ring, pos) as i32
-                                    } else {
-                                        0
-                                    };
-                                    // Pairs around the anchor: ref vs ring value
-                                    // by value — offset vs gain vs skew at a look.
-                                    let mut pairs: Vec<String> = Vec::new();
-                                    for m in 0..10 {
-                                        let ri = i0 + m;
-                                        let pi = p + 3 * ri as i64;
-                                        if pi >= 0 && pi < head && ri < n {
-                                            pairs.push(format!("{}:{}", r[ri], at(&ring, pi)));
-                                        }
-                                    }
-                                    // Raw bytes of the first few ref samples:
-                                    // settles the ch8 S24 encoding (sign position,
-                                    // shift, offset) without more theory.
-                                    let mut raws: Vec<String> = Vec::new();
-                                    for m in 0..6 {
-                                        let ri = i0 + m;
-                                        if ri < n {
-                                            let b = &r_bytes[ri * 3..ri * 3 + 3];
-                                            raws.push(format!(
-                                                "{:02x}{:02x}{:02x}",
-                                                b[0], b[1], b[2]
-                                            ));
-                                        }
-                                    }
-                                    fwlog!("[aec] dealias raw ch8 bytes: {raws:?}");
-                                    fwlog!(
-                                    "[aec] dealias miss: cand pos {p} prefix {k} diff {diff} pairs(r:ring) {pairs:?} (head {head}, i0 {i0})"
-                                );
-                                    shown += 1;
-                                }
-                            }
-                            j -= 1;
-                        }
-                        fwlog!(
-                        "[aec] dealias miss: {candidates} anchor candidates, best prefix {best_prefix} (r0 {r0}, head {head})"
-                    );
-                        let rs: Vec<i32> = r.iter().skip(i0).take(12).map(|s| *s as i32).collect();
-                        let mut tail: Vec<i32> = Vec::new();
-                        for k in 0..12 {
-                            let pos = head - 12 + k as i64;
-                            tail.push(at(&ring, pos) as i32);
-                        }
-                        let rmax = r.iter().map(|s| s.abs()).max().unwrap_or(0);
-                        let wmax = (lo..head).map(|p| at(&ring, p).abs()).max().unwrap_or(0);
-                        fwlog!(
-                        "[aec] dealias ref[i0..]={rs:?} ring_tail={tail:?} ref_max={rmax} ring_max={wmax}"
-                    );
-                    }
-                } // MISS_DEBUG
                 inner.misses += 1;
                 if inner.misses >= MAX_MISSES as u32 {
                     inner.misses = 0;
@@ -528,7 +438,7 @@ mod tests {
             *slot = at(&ring, start_off + 3 * i as i64);
         }
         drop(ring);
-        let cleaned = d.clean(&ch8, &[]);
+        let cleaned = d.clean(&ch8);
         assert_eq!(
             cleaned.state,
             LockState::Locked,
@@ -556,7 +466,7 @@ mod tests {
             *slot = at(&ring, 4000 + 3 * i as i64);
         }
         drop(ring);
-        let cleaned_b = d2.clean(&ch8b, &[]);
+        let cleaned_b = d2.clean(&ch8b);
         assert_eq!(cleaned_b.state, LockState::Locked, "smooth tone must lock");
         assert!(d2.stats().locked, "smooth tone must lock");
         let cleaned_b = cleaned_b.samples;
@@ -574,7 +484,7 @@ mod tests {
     fn silence_passthrough_and_unlocked_is_never_the_raw_alias() {
         let d = Dealias::new();
         let silent = vec![0i16; 160];
-        let out = d.clean(&silent, &[]);
+        let out = d.clean(&silent);
         assert_eq!(out.samples, silent);
         assert_eq!(out.state, LockState::Degraded, "no lock yet: honest state");
         // Loud but not derived from the (empty) ring: the output must NOT
@@ -583,7 +493,7 @@ mod tests {
         // history the only honest reference is silence.
         let loud = vec![5000i16; 160];
         for _ in 0..5 {
-            let out = d.clean(&loud, &[]);
+            let out = d.clean(&loud);
             assert_eq!(
                 out.samples,
                 vec![0i16; 160],
@@ -618,12 +528,12 @@ mod tests {
             *slot = at(&ring, start + 3 * i as i64);
         }
         drop(ring);
-        assert_eq!(d.clean(&ch8, &[]).state, LockState::Locked);
+        assert_eq!(d.clean(&ch8).state, LockState::Locked);
         // Corrupt one sample of the next frame: the match fails, and the
         // block must report Degraded (coast), never pretend it was clean.
         let mut broken = ch8.clone();
         broken[100] = broken[100].wrapping_add(4000);
-        let out = d.clean(&broken, &[]);
+        let out = d.clean(&broken);
         assert_eq!(out.state, LockState::Degraded);
         assert_ne!(
             out.samples, broken,
@@ -667,7 +577,7 @@ mod tests {
         };
 
         // 1. Lock on the first block.
-        let out_a = d.clean(&ch8_a, &[]);
+        let out_a = d.clean(&ch8_a);
         assert_eq!(out_a.state, LockState::Locked);
         let pos_after_a = d.inner.lock().unwrap().pos;
 
@@ -675,7 +585,7 @@ mod tests {
         // non-zero audio at `pos` (simulating dropped/zeroed ch8 samples).
         let zeros = vec![0i16; n];
         for _ in 0..5 {
-            let out_z = d.clean(&zeros, &[]);
+            let out_z = d.clean(&zeros);
             assert_eq!(out_z.samples, zeros);
             assert_eq!(out_z.state, LockState::Degraded);
         }
@@ -687,7 +597,7 @@ mod tests {
 
         // 3. Feed the aligned continuation block: stays locked immediately
         // without full-range search, losses, or relocks.
-        let out_b = d.clean(&ch8_b, &[]);
+        let out_b = d.clean(&ch8_b);
         assert_eq!(out_b.state, LockState::Locked);
         let st = d.stats();
         assert!(st.locked);
@@ -698,9 +608,9 @@ mod tests {
         // 4. After an explicit DAC drop (Flush), feeding a new non-zero block
         // relocks on the very first block without counting a loss.
         d.on_dac_drop();
-        let out_z2 = d.clean(&zeros, &[]);
+        let out_z2 = d.clean(&zeros);
         assert_eq!(out_z2.state, LockState::Degraded);
-        let out_relock = d.clean(&ch8_b, &[]);
+        let out_relock = d.clean(&ch8_b);
         assert_eq!(out_relock.state, LockState::Locked);
         let st2 = d.stats();
         assert!(st2.locked);
@@ -720,9 +630,9 @@ mod tests {
         }
         d.feed(&period);
         let first: Vec<i16> = (0..320).map(|i| period[2 * (300 + 3 * i)]).collect();
-        assert_eq!(d.clean(&first, &[]).state, LockState::Locked);
+        assert_eq!(d.clean(&first).state, LockState::Locked);
         assert_eq!(d.inner.lock().unwrap().pos, 1260);
-        let silence = d.clean(&[0; 320], &[]);
+        let silence = d.clean(&[0; 320]);
         assert_eq!(silence.state, LockState::Locked);
         assert_eq!(d.inner.lock().unwrap().pos, 2220);
     }

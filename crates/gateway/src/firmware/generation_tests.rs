@@ -235,14 +235,12 @@ fn playback_rejects_old_pcm_end_and_flush_after_fresh_samples_are_installed() {
             events,
             shared,
             None,
-            1.0,
             false,
             0.0,
             None,
             None,
             vec![],
             false,
-            None,
             progress,
             fault,
             alive,
@@ -483,14 +481,12 @@ async fn shared_playback_waits_for_last_writer_before_finish_and_releases_idle_s
             events,
             shared,
             None,
-            1.0,
             false,
             0.0,
             None,
             None,
             vec![],
             false,
-            None,
             progress,
             fault,
             alive,
@@ -544,4 +540,631 @@ async fn shared_playback_waits_for_last_writer_before_finish_and_releases_idle_s
     assert_eq!(hw.drain_calls.load(Ordering::Acquire), 1);
     drop(role);
     worker.join().unwrap();
+}
+
+#[cfg(feature = "board-lx06")]
+#[tokio::test]
+async fn lx06_shared_playback_flush_confirms_stop_receipt_without_error() {
+    use tokio::io::AsyncBufReadExt;
+    use tokio::time::{timeout, Duration};
+
+    let hw = super::lx06::test_shared_hardware_from_cat();
+    let (role, rx) = role::isolated_role(hw.clone());
+    let tx = NorthTx::new(
+        "fixture-dot".into(),
+        1,
+        role.northbound_stats.clone(),
+        role.dropped_audio.clone(),
+    );
+    let (sink, reader) = tokio::io::duplex(8192);
+    let writer_tx = tx.clone();
+    let writer = tokio::spawn(async move { writer_tx.write_to(sink).await });
+    let mut lines = BufReader::new(reader).lines();
+
+    {
+        let mut sh = role.shared.lock().unwrap();
+        sh.link_gen = 1;
+        sh.north_tx = Some(tx.clone());
+        sh.active[0] = Some(("t-lx06-stop".into(), 1000));
+    }
+    let stamp = role.shared.lock().unwrap().stamp(Chan::Voice);
+    role.play_tx
+        .send(PlayCmd {
+            stamp,
+            action: PlayAction::Samples {
+                chan: Chan::Voice,
+                samples: vec![500; PLAY_PERIOD as usize * 2],
+            },
+        })
+        .unwrap();
+
+    let (events, mut observed) = mpsc::unbounded_channel();
+    let shared = role.shared.clone();
+    let progress = role.progress.clone();
+    let fault = role.fault.clone();
+    let alive = role.playback_alive.clone();
+    let worker = std::thread::spawn(move || {
+        playback_thread(
+            hw,
+            rx,
+            events,
+            shared,
+            None,
+            false,
+            0.0,
+            None,
+            None,
+            vec![],
+            false,
+            progress,
+            fault,
+            alive,
+        );
+    });
+
+    // Wait briefly for playback_thread to write at least one period to the cat helper.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    role.on_core_frame(
+        CoreFrame::Stop {
+            task_id: "t-lx06-stop".into(),
+            flush: true,
+        },
+        &tx,
+    )
+    .unwrap();
+
+    let ev = timeout(Duration::from_secs(2), observed.recv())
+        .await
+        .expect("FlushDone timeout")
+        .expect("FlushDone event");
+    assert!(
+        matches!(
+            &ev,
+            PlayEvent::FlushDone {
+                flush_err: None,
+                ..
+            }
+        ),
+        "SharedPlayback::flush() must succeed after reaping helper: {ev:?}"
+    );
+    role.on_play_event(ev);
+
+    let line = timeout(Duration::from_secs(1), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let frame: GatewayFrame = serde_json::from_str(&line).unwrap();
+    match frame {
+        GatewayFrame::StopReceipt {
+            task_id,
+            stage,
+            played_ms,
+            progress_basis,
+            detail,
+            ..
+        } => {
+            assert_eq!(task_id, "t-lx06-stop");
+            assert_eq!(stage, "device_confirmed");
+            assert_eq!(detail, None);
+            assert!(played_ms.is_some());
+            assert_eq!(progress_basis.as_deref(), Some("written"));
+        }
+        other => panic!("expected StopReceipt, got {other:?}"),
+    }
+
+    tx.fail("fixture_done");
+    writer.abort();
+    drop(role);
+    worker.join().unwrap();
+}
+
+#[tokio::test]
+async fn decode_gen_bump_settles_pending_stop_local_exit_and_local_stop_without_locking() {
+    use tokio::io::AsyncBufReadExt;
+    use tokio::time::{timeout, Duration};
+
+    let (role, _rx) = role::isolated_role(Arc::new(HardwareProbe::default()));
+    let tx = NorthTx::new(
+        "fixture-dot".into(),
+        1,
+        role.northbound_stats.clone(),
+        role.dropped_audio.clone(),
+    );
+    let (sink, reader) = tokio::io::duplex(16384);
+    let writer_tx = tx.clone();
+    let writer = tokio::spawn(async move { writer_tx.write_to(sink).await });
+    let mut lines = BufReader::new(reader).lines();
+
+    {
+        let mut sh = role.shared.lock().unwrap();
+        sh.link_gen = 1;
+        sh.north_tx = Some(tx.clone());
+        sh.active[0] = Some(("old-voice".into(), 1000));
+        sh.pending_stop[0] = Some("old-stop".into());
+        sh.local_stop = Some(("old-voice".into(), now_ms()));
+        sh.local_exit = Some(wire::LocalExit {
+            keyword: "停止播放".into(),
+            fired_ms: now_ms(),
+            flushed: 1,
+            pending: 1,
+            voice_task: Some("old-voice".into()),
+            music_task: None,
+            flush_err: None,
+            deferred_keyword: None,
+        });
+    }
+
+    // 1. A Music FlushDone must NOT consume Voice's local_stop!
+    let music_stamp = role.shared.lock().unwrap().stamp(Chan::Music);
+    role.on_play_event(PlayEvent::FlushDone {
+        stamp: music_stamp,
+        chan: Chan::Music,
+        played_ms: 0,
+        delay_frames: None,
+        flush_err: None,
+        at_ms: now_ms(),
+    });
+    assert!(
+        role.shared.lock().unwrap().local_stop.is_some(),
+        "Music FlushDone must not steal Voice local_stop"
+    );
+
+    // 2. New PlayBegin on Voice bumps decode_gen[0]: must settle pending_stop,
+    // settle local_exit, and clear local_stop so nothing is dropped or locked.
+    role.on_core_frame(begin(), &tx).unwrap();
+    {
+        let sh = role.shared.lock().unwrap();
+        assert!(sh.pending_stop[0].is_none());
+        assert!(sh.local_stop.is_none());
+        assert!(sh.local_exit.is_none());
+    }
+    let mut saw_stop = false;
+    let mut saw_exit = false;
+    for _ in 0..4 {
+        let line = timeout(Duration::from_secs(1), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let frame: GatewayFrame = serde_json::from_str(&line).unwrap();
+        match frame {
+            GatewayFrame::StopReceipt {
+                task_id,
+                stage,
+                detail,
+                ..
+            } if task_id == "old-stop" => {
+                assert_eq!(stage, "device_confirmed");
+                assert_eq!(detail, None);
+                saw_stop = true;
+            }
+            GatewayFrame::LocalExitFlushed { keyword, .. } if keyword == "停止播放" => {
+                saw_exit = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_stop,
+        "pending_stop must emit StopReceipt on decode_gen bump"
+    );
+    assert!(saw_exit, "local_exit must settle on decode_gen bump");
+
+    // 3. Bounded 2_000 ms age timeout expires orphaned local_exit & local_stop
+    //    and still emits LocalExitFlushed strictly BEFORE any deferred retreat Keyword.
+    let stale_ts = now_ms().saturating_sub(LOCAL_FLUSH_LOCK_TIMEOUT_MS + 50);
+    {
+        let mut sh = role.shared.lock().unwrap();
+        sh.local_stop = Some(("stuck-voice".into(), stale_ts));
+        sh.local_exit = Some(wire::LocalExit {
+            keyword: "退出".into(),
+            fired_ms: stale_ts,
+            flushed: 3,
+            pending: 3,
+            voice_task: None,
+            music_task: None,
+            flush_err: None,
+            deferred_keyword: Some(GatewayFrame::Keyword {
+                device: "fixture-dot".into(),
+                ts: stale_ts,
+                seq: 0,
+                keyword: "退出".into(),
+                fed_ms: Some(1200),
+                self_heard: false,
+                rms_dbfs: None,
+                lag_ms: Some(0),
+                bundle_id: None,
+                kws_generation: None,
+                kws_tier: None,
+                wake_dur_ms: None,
+                max_gap_ms: None,
+                l2_passed: None,
+            }),
+        });
+    }
+    role.watch_local_flush_locks();
+    {
+        let sh = role.shared.lock().unwrap();
+        assert!(sh.local_stop.is_none(), "stale local_stop must expire");
+        assert!(sh.local_exit.is_none(), "stale local_exit must expire");
+    }
+    let line1 = timeout(Duration::from_secs(1), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let frame1: GatewayFrame = serde_json::from_str(&line1).unwrap();
+    assert!(matches!(
+        frame1,
+        GatewayFrame::LocalExitFlushed { keyword, detail, .. }
+            if keyword == "退出" && detail.as_deref() == Some("flush_timeout")
+    ));
+    let line2 = timeout(Duration::from_secs(1), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let frame2: GatewayFrame = serde_json::from_str(&line2).unwrap();
+    assert!(matches!(
+        frame2,
+        GatewayFrame::Keyword { keyword, .. } if keyword == "退出"
+    ));
+
+    tx.fail("fixture_done");
+    writer.abort();
+}
+
+#[tokio::test]
+async fn audio_eq_pending_receipt_handles_supersede_legacy_and_dead_playback() {
+    use crate::protocol::{ConfigBlock, ConfigReceiptStatus};
+    use tokio::io::AsyncBufReadExt;
+    use tokio::time::{timeout, Duration};
+
+    let (mut role, _rx) = role::isolated_role(Arc::new(HardwareProbe::default()));
+    let state_dir =
+        std::env::temp_dir().join(format!("hm-eq-race-{}-{}", std::process::id(), now_ms()));
+    std::fs::create_dir_all(&state_dir).unwrap();
+    role.cfg.state_dir = state_dir.clone();
+
+    let tx = NorthTx::new(
+        "fixture-dot".into(),
+        1,
+        role.northbound_stats.clone(),
+        role.dropped_audio.clone(),
+    );
+    let (sink, reader) = tokio::io::duplex(16384);
+    let writer_tx = tx.clone();
+    let writer = tokio::spawn(async move { writer_tx.write_to(sink).await });
+    let mut lines = BufReader::new(reader).lines();
+
+    {
+        let mut sh = role.shared.lock().unwrap();
+        sh.link_gen = 1;
+        sh.north_tx = Some(tx.clone());
+        sh.negotiated_protocol = 2;
+        sh.config_apply_v2 = true;
+    }
+
+    let eq_apply = |op: &str, gen: u64, curve: &str| CoreFrame::ConfigApply {
+        device: "fixture-dot".into(),
+        core_node_id: "core-1".into(),
+        data_epoch: 1,
+        application_id: format!("app-{op}"),
+        operation_id: op.into(),
+        desired_revision: gen,
+        block_generation: gen,
+        block: ConfigBlock::AudioEq,
+        schema_version: 1,
+        block_hash: format!("hash-{op}"),
+        expected_gateway_boot_id: None,
+        expected_state_revision: None,
+        capability_fingerprint: None,
+        values: json!({ "curve": curve, "bands": [] }),
+    };
+
+    // 1. Two rapid ConfigApply(AudioEq) before the 42ms boundary: op-1 must emit Superseded.
+    role.on_core_frame(eq_apply("op-eq-1", 1, "rui"), &tx)
+        .unwrap();
+    let rev1 = role.shared.lock().unwrap().eq_rev;
+    role.on_core_frame(eq_apply("op-eq-2", 2, "official"), &tx)
+        .unwrap();
+    let rev2 = role.shared.lock().unwrap().eq_rev;
+    let line = timeout(Duration::from_secs(1), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let f1: GatewayFrame = serde_json::from_str(&line).unwrap();
+    assert!(matches!(
+        f1,
+        GatewayFrame::ConfigReceipt {
+            operation_id,
+            status: ConfigReceiptStatus::Superseded,
+            ..
+        } if operation_id == "op-eq-1"
+    ));
+
+    // Stale EqApplied for rev1 must NOT settle op-eq-2 prematurely.
+    role.on_play_event(PlayEvent::EqApplied { eq_rev: rev1 });
+    assert!(role.shared.lock().unwrap().pending_eq_receipt.is_some());
+
+    // EqApplied at rev >= rev2 settles op-eq-2 as Active.
+    role.on_play_event(PlayEvent::EqApplied { eq_rev: rev2 + 1 });
+    assert!(role.shared.lock().unwrap().pending_eq_receipt.is_none());
+    let line = timeout(Duration::from_secs(1), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let f2: GatewayFrame = serde_json::from_str(&line).unwrap();
+    assert!(matches!(
+        f2,
+        GatewayFrame::ConfigReceipt {
+            operation_id,
+            status: ConfigReceiptStatus::Active,
+            ..
+        } if operation_id == "op-eq-2"
+    ));
+
+    // 2. Legacy CoreFrame::AudioEq arriving mid-flight supersedes pending op-eq-3.
+    role.on_core_frame(eq_apply("op-eq-3", 3, "echomuse"), &tx)
+        .unwrap();
+    role.on_core_frame(
+        CoreFrame::AudioEq {
+            device: "fixture-dot".into(),
+            curve: "rui".into(),
+            bands: vec![],
+        },
+        &tx,
+    )
+    .unwrap();
+    assert!(role.shared.lock().unwrap().pending_eq_receipt.is_none());
+    let line = timeout(Duration::from_secs(1), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let f3: GatewayFrame = serde_json::from_str(&line).unwrap();
+    assert!(matches!(
+        f3,
+        GatewayFrame::ConfigReceipt {
+            operation_id,
+            status: ConfigReceiptStatus::Superseded,
+            error_code,
+            ..
+        } if operation_id == "op-eq-3" && error_code.as_deref() == Some("superseded_by_legacy_audio_eq")
+    ));
+
+    // 3. Dead playback_alive rejects ConfigApply(AudioEq) even if sh.play_tx is Some.
+    role.shared.lock().unwrap().play_tx = Some(role.play_tx.clone());
+    role.playback_alive.store(false, Ordering::Release);
+    role.on_core_frame(eq_apply("op-eq-4", 4, "rui"), &tx)
+        .unwrap();
+    let line = timeout(Duration::from_secs(1), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let f4: GatewayFrame = serde_json::from_str(&line).unwrap();
+    assert!(matches!(
+        f4,
+        GatewayFrame::ConfigReceipt {
+            operation_id,
+            status: ConfigReceiptStatus::Failed,
+            error_code,
+            ..
+        } if operation_id == "op-eq-4" && error_code.as_deref() == Some("playback_unavailable")
+    ));
+
+    tx.fail("fixture_done");
+    writer.abort();
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+#[tokio::test]
+async fn pending_kws_receipt_uses_monotonic_deadline_and_20s_default_timeout() {
+    use crate::protocol::{ConfigBlock, ConfigReceiptStatus};
+    use tokio::io::AsyncBufReadExt;
+    use tokio::time::{timeout, Duration};
+
+    assert_eq!(north_config::KWS_RELOAD_TIMEOUT_MS, 20_000);
+
+    let (mut role, _rx) = role::isolated_role(Arc::new(HardwareProbe::default()));
+    let state_dir = std::env::temp_dir().join(format!(
+        "hm-kws-timeout-{}-{}",
+        std::process::id(),
+        now_ms()
+    ));
+    std::fs::create_dir_all(&state_dir).unwrap();
+    role.cfg.state_dir = state_dir.clone();
+    assert_eq!(role.cfg.kws_reload_timeout_ms, 20_000);
+
+    let tx = NorthTx::new(
+        "fixture-dot".into(),
+        1,
+        role.northbound_stats.clone(),
+        role.dropped_audio.clone(),
+    );
+    let (sink, reader) = tokio::io::duplex(16384);
+    let writer_tx = tx.clone();
+    let writer = tokio::spawn(async move { writer_tx.write_to(sink).await });
+    let mut lines = BufReader::new(reader).lines();
+
+    let staged_mono = kws::mono_ms();
+    let make_pending = |op: &str, staged_ms: u64| north_config::PendingKwsConfig {
+        target_gen: 1,
+        staged_ms,
+        receipt: config_journal::ConfigReceiptData {
+            device: "fixture-dot".into(),
+            gateway_boot_id: "boot-test".into(),
+            operation_id: op.into(),
+            application_id: format!("app-{op}"),
+            data_epoch: 1,
+            desired_revision: 1,
+            block_generation: 1,
+            block: ConfigBlock::Kws,
+            block_hash: format!("hash-{op}"),
+            state_revision: 0,
+            status: ConfigReceiptStatus::Persisted,
+            persisted_hash: Some(format!("hash-{op}")),
+            active_hash: None,
+            active_values: None,
+            evidence: None,
+            error_code: None,
+            retryable: false,
+        },
+        persisted_values: serde_json::json!({"keywords_hash": "abcd"}),
+        detail: "staged".into(),
+        signalled: true,
+    };
+
+    {
+        let mut sh = role.shared.lock().unwrap();
+        sh.north_tx = Some(tx.clone());
+        sh.pending_kws_receipt = Some(make_pending("op-mono-live", staged_mono));
+    }
+
+    // Live monotonic check must NOT expire a freshly staged entry (even though
+    // wall-clock now_ms() is decades ahead of monotonic uptime).
+    role.watch_pending_kws_receipt();
+    assert!(
+        role.shared.lock().unwrap().pending_kws_receipt.is_some(),
+        "freshly staged monotonic pending KWS op must not expire"
+    );
+
+    // Deterministic monotonic boundary check at 15 s (old limit) and 19.999 s vs 20 s.
+    {
+        let mut sh = role.shared.lock().unwrap();
+        sh.pending_kws_receipt = Some(make_pending("op-mono-20s", 1_000));
+    }
+    role.watch_pending_kws_receipt_at(1_000 + 15_000);
+    assert!(
+        role.shared.lock().unwrap().pending_kws_receipt.is_some(),
+        "must not time out at old 15_000 ms bound"
+    );
+    role.watch_pending_kws_receipt_at(1_000 + 19_999);
+    assert!(
+        role.shared.lock().unwrap().pending_kws_receipt.is_some(),
+        "must not time out before 20_000 ms bound"
+    );
+    role.watch_pending_kws_receipt_at(1_000 + 20_000);
+    assert!(
+        role.shared.lock().unwrap().pending_kws_receipt.is_none(),
+        "must expire at 20_000 ms monotonic bound"
+    );
+
+    let line = timeout(Duration::from_secs(1), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let frame: GatewayFrame = serde_json::from_str(&line).unwrap();
+    let GatewayFrame::ConfigReceipt {
+        operation_id,
+        status,
+        persisted_hash,
+        active_hash,
+        error_code,
+        retryable,
+        evidence,
+        ..
+    } = frame
+    else {
+        panic!("expected ConfigReceipt, got {frame:?}");
+    };
+    assert_eq!(operation_id, "op-mono-20s");
+    assert_eq!(status, ConfigReceiptStatus::Failed);
+    assert_eq!(persisted_hash.as_deref(), Some("hash-op-mono-20s"));
+    assert_eq!(active_hash, None);
+    assert_eq!(error_code.as_deref(), Some("kws_reload_timeout"));
+    assert!(retryable);
+    assert_eq!(
+        evidence.as_ref().and_then(|e| e["timeout_ms"].as_u64()),
+        Some(20_000)
+    );
+
+    tx.fail("fixture_done");
+    writer.abort();
+    let _ = std::fs::remove_dir_all(&state_dir);
+}
+
+#[cfg(feature = "board-lx06")]
+#[test]
+fn lx06_indicator_handoff_runs_outside_shared_lock() {
+    use super::lx06_vendor::VendorMonitor;
+
+    struct LockCheckingHw {
+        shared: Mutex<Option<Arc<Mutex<role::Shared>>>>,
+        indicator_calls: AtomicU64,
+    }
+    impl Hardware for LockCheckingHw {
+        fn set_home_indicator(&self, _owner: lx06::IndicatorOwner) {
+            self.indicator_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(shared) = self.shared.lock().unwrap().as_ref() {
+                assert!(
+                    shared.try_lock().is_ok(),
+                    "set_home_indicator must NEVER be called while holding shared.lock()"
+                );
+            }
+        }
+        fn capture_read(&self, _: &mut [u8], _: u32) -> io::Result<u32> {
+            Ok(0)
+        }
+        fn playback_write(&self, _: &[i16], frames: u32) -> io::Result<u32> {
+            Ok(frames)
+        }
+        fn playback_flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn playback_drain(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn playback_underruns(&self) -> u64 {
+            0
+        }
+        fn led_write(&self, _: &[(u8, u8, u8); 12]) -> io::Result<()> {
+            if let Some(shared) = self.shared.lock().unwrap().as_ref() {
+                assert!(
+                    shared.try_lock().is_ok(),
+                    "led_write must NEVER be called while holding shared.lock()"
+                );
+            }
+            Ok(())
+        }
+        fn button_next(&self) -> io::Result<ButtonEvent> {
+            Err(io::Error::other("fixture"))
+        }
+        fn wake_lock(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let hw = Arc::new(LockCheckingHw {
+        shared: Mutex::new(None),
+        indicator_calls: AtomicU64::new(0),
+    });
+    let (role, _rx) = role::isolated_role(hw.clone());
+    *hw.shared.lock().unwrap() = Some(role.shared.clone());
+    let monitor = VendorMonitor::test_observer(false, true);
+    role.shared.lock().unwrap().vendor = Some(monitor);
+
+    // 1. render_ring must release shared.lock() before set_home_indicator & led_write.
+    north::render_ring(&role.shared, &role.hw);
+    // 2. reserve_decoded_play must release shared.lock() before set_home_indicator.
+    let tx = NorthTx::new(
+        "fixture-dot".into(),
+        1,
+        role.northbound_stats.clone(),
+        role.dropped_audio.clone(),
+    );
+    let reserve = role.on_core_frame(begin(), &tx).unwrap().unwrap();
+    decode_one(&role, reserve);
+    // 3. teardown_link must release shared.lock() before set_home_indicator.
+    role.teardown_link();
+
+    assert!(
+        hw.indicator_calls.load(Ordering::Relaxed) >= 3,
+        "expected render_ring, reserve_decoded_play, and teardown_link to call set_home_indicator"
+    );
 }

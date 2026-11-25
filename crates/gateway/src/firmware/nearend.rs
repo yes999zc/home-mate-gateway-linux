@@ -45,6 +45,7 @@ pub struct EvalOutput {
 
 pub struct NearEndEvaluator {
     device_id: String,
+    profile_version: String,
     aec_enabled: bool,
     loopback_only: bool,
     noise_floor_dbfs: f32,
@@ -68,6 +69,7 @@ impl NearEndEvaluator {
         let initial_health = EchoPathHealth::Unknown;
         Self {
             device_id: device_id.into(),
+            profile_version: PROFILE_VERSION.to_string(),
             aec_enabled,
             loopback_only,
             noise_floor_dbfs: DEFAULT_NOISE_FLOOR_DBFS,
@@ -95,6 +97,11 @@ impl NearEndEvaluator {
                 reason: "init",
             },
         }
+    }
+
+    pub fn with_profile_version(mut self, profile_version: impl Into<String>) -> Self {
+        self.profile_version = profile_version.into();
+        self
     }
 
     pub fn echo_health(&self) -> EchoPathHealth {
@@ -265,7 +272,7 @@ impl NearEndEvaluator {
                 snr_db,
                 clipped,
                 echo_health,
-                profile_version: PROFILE_VERSION.to_string(),
+                profile_version: self.profile_version.clone(),
             })
         } else {
             None

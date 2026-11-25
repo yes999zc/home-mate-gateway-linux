@@ -6,9 +6,168 @@ fn firmware_core_address_must_be_loopback() {
     assert!(core_addr_is_loopback("127.0.0.1:8932"));
     assert!(core_addr_is_loopback("localhost:8932"));
     assert!(core_addr_is_loopback("[::1]:8932"));
+    assert!(core_addr_is_loopback("[::ffff:127.0.0.1]:8932"));
+    assert!(!core_addr_is_loopback("127.0.0.1:0"));
+    assert!(!core_addr_is_loopback("[::1]:0"));
+    assert!(!core_addr_is_loopback("localhost:0"));
+    assert!(!core_addr_is_loopback("[::ffff:127.0.0.1]:0"));
     assert!(!core_addr_is_loopback("192.168.1.27:8932"));
     assert!(!core_addr_is_loopback("0.0.0.0:8932"));
     assert!(!core_addr_is_loopback("not-an-address"));
+}
+
+#[test]
+fn firmware_core_address_lan_opt_in_accepts_private_and_rejects_public() {
+    // Default (allow_lan = false) stays strictly loopback-only (with non-zero port).
+    assert!(core_addr_allowed("127.0.0.1:8932", false));
+    assert!(core_addr_allowed("localhost:8932", false));
+    assert!(core_addr_allowed("[::1]:8932", false));
+    assert!(core_addr_allowed("[::ffff:127.0.0.1]:8932", false));
+    assert!(!core_addr_allowed("127.0.0.1:0", false));
+    assert!(!core_addr_allowed("[::1]:0", false));
+    assert!(!core_addr_allowed("localhost:0", false));
+    assert!(!core_addr_allowed("192.168.1.50:8932", false));
+    assert!(!core_addr_allowed("10.0.0.5:8932", false));
+    assert!(!core_addr_allowed("100.64.0.1:8932", false));
+    assert!(!core_addr_allowed("[fd7a:115c:a1e0::1]:8932", false));
+
+    // Opt-in (--allow-lan-core) permits loopback + RFC1918 + Tailscale CGNAT + IPv6 ULA.
+    for ok in [
+        "127.0.0.1:8932",
+        "localhost:8932",
+        "[::1]:8932",
+        "[::ffff:127.0.0.1]:8932",
+        "10.0.0.1:8932",
+        "172.16.0.1:8932",
+        "172.31.255.254:8932",
+        "192.168.1.50:8932",
+        "100.64.0.1:8932",
+        "100.127.255.254:8932",
+        "[::ffff:192.168.1.50]:8932",
+        "[::ffff:100.64.10.20]:8932",
+        "[fc00::1]:8932",
+        "[fd7a:115c:a1e0::1]:8932",
+    ] {
+        assert!(
+            core_addr_allowed(ok, true),
+            "{ok} should be allowed with --allow-lan-core"
+        );
+    }
+
+    // Public internet, unspecified, link-local, multicast, hostnames, and port 0 remain rejected.
+    for bad in [
+        "127.0.0.1:0",
+        "[::1]:0",
+        "localhost:0",
+        "[::ffff:127.0.0.1]:0",
+        "8.8.8.8:8932",
+        "1.1.1.1:8932",
+        "100.63.255.255:8932",
+        "100.128.0.1:8932",
+        "172.15.255.255:8932",
+        "172.32.0.1:8932",
+        "192.169.1.1:8932",
+        "169.254.1.1:8932",
+        "224.0.0.1:8932",
+        "0.0.0.0:8932",
+        "[::]:8932",
+        "[fe80::1]:8932",
+        "[2001:4860:4860::8888]:8932",
+        "[2606:4700:4700::1111]:8932",
+        "example.com:8932",
+        "192.168.1.50:0",
+        "192.168.1.50",
+        "not-an-address",
+    ] {
+        assert!(
+            !core_addr_allowed(bad, true),
+            "{bad} must be rejected even with --allow-lan-core"
+        );
+    }
+}
+
+#[test]
+fn auth_token_env_precedence_prefers_core_token_over_gateway_token() {
+    assert_eq!(
+        wire::resolve_auth_token_from_lookup(|k| match k {
+            "HM_CORE_AUTH_TOKEN" => Some("  hm1_core_tok \n".into()),
+            "HM_GATEWAY_AUTH_TOKEN" => Some("hm1_gw_tok".into()),
+            _ => None,
+        }),
+        Some("hm1_core_tok".into())
+    );
+    assert_eq!(
+        wire::resolve_auth_token_from_lookup(|k| match k {
+            "HM_CORE_AUTH_TOKEN" => Some("   \t\n ".into()),
+            "HM_GATEWAY_AUTH_TOKEN" => Some(" hm1_gw_fallback ".into()),
+            _ => None,
+        }),
+        Some("hm1_gw_fallback".into())
+    );
+    assert_eq!(
+        wire::resolve_auth_token_from_lookup(|k| match k {
+            "HM_CORE_AUTH_TOKEN" => Some("".into()),
+            "HM_GATEWAY_AUTH_TOKEN" => Some("   ".into()),
+            _ => None,
+        }),
+        None
+    );
+    assert_eq!(wire::resolve_auth_token_from_lookup(|_| None), None);
+}
+
+#[test]
+fn hello_frame_carries_optional_auth_token_when_configured() {
+    struct NoopHw;
+    impl Hardware for NoopHw {
+        fn capture_read(&self, _: &mut [u8], _: u32) -> io::Result<u32> {
+            Ok(0)
+        }
+        fn playback_write(&self, _: &[i16], frames: u32) -> io::Result<u32> {
+            Ok(frames)
+        }
+        fn playback_flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn playback_drain(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn playback_underruns(&self) -> u64 {
+            0
+        }
+        fn led_write(&self, _: &[(u8, u8, u8); 12]) -> io::Result<()> {
+            Ok(())
+        }
+        fn button_next(&self) -> io::Result<ButtonEvent> {
+            Err(io::Error::other("noop"))
+        }
+        fn wake_lock(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    assert_eq!(wire::normalize_auth_token(""), None);
+    assert_eq!(wire::normalize_auth_token("   \n\t "), None);
+    assert_eq!(
+        wire::normalize_auth_token("  hm1_test_tok \n"),
+        Some("hm1_test_tok".into())
+    );
+
+    let (mut role, _rx) = role::isolated_role(Arc::new(NoopHw));
+    role.cfg.auth_token = None;
+    let hello_no_auth = north_link::build_hello_frame(&role);
+    let encoded_no_auth = crate::protocol::encode_gateway(&hello_no_auth).unwrap();
+    assert!(!encoded_no_auth.contains("auth_token"));
+
+    role.cfg.auth_token = Some("hm1_lan_secret_token".into());
+    let hello_with_auth = north_link::build_hello_frame(&role);
+    let encoded_with_auth = crate::protocol::encode_gateway(&hello_with_auth).unwrap();
+    assert!(encoded_with_auth.contains("\"auth_token\":\"hm1_lan_secret_token\""));
+    match crate::protocol::decode_gateway(&encoded_with_auth).unwrap() {
+        GatewayFrame::Hello { auth_token, .. } => {
+            assert_eq!(auth_token.as_deref(), Some("hm1_lan_secret_token"));
+        }
+        other => panic!("expected Hello frame, got {other:?}"),
+    }
 }
 
 #[test]
@@ -31,9 +190,6 @@ fn wifi_conf_rejects_quotes_backslashes_and_controls() {
 #[test]
 fn play_progress_records_the_live_set_at_the_write_site() {
     let p = PlayProgress::default();
-    // Stale live mask (the play has not been drained yet) — the write
-    // itself says which channels it blocks.
-    p.set_live(0, false);
     p.begin_write(0b01);
     let t = kws::mono_ms();
     assert_eq!(
@@ -385,6 +541,7 @@ fn a_local_exit_flushes_every_live_channel_and_only_its_own_slot() {
         voice_task: Some("answer".into()),
         music_task: None,
         flush_err: None,
+        deferred_keyword: None,
     };
     assert_eq!(
         ex.channels(),
@@ -524,22 +681,14 @@ fn rss_budget_constants_and_check() {
 #[test]
 fn aec_pipeline_resyncs_promptly_after_dac_drop() {
     let (mut pipe, ref_feed) = aec::Pipeline::new(aec::TAIL);
-    let encode_ch8_block = |ch8: &[i16]| -> (Vec<[i16; 9]>, Vec<u8>) {
-        let mut decoded = Vec::with_capacity(ch8.len());
-        let mut bytes = Vec::with_capacity(ch8.len() * CAP_CHANNELS * 3);
-        for (i, &r) in ch8.iter().enumerate() {
-            let mut row = [0i16; 9];
-            row[8] = r;
-            decoded.push(row);
-            for c in 0..CAP_CHANNELS {
-                let v: i32 = if c == 8 { (r as i32) << 8 } else { 0 };
-                bytes.push((v & 0xff) as u8);
-                bytes.push(((v >> 8) & 0xff) as u8);
-                bytes.push(((v >> 16) & 0xff) as u8);
-            }
-            let _ = i;
-        }
-        (decoded, bytes)
+    let encode_ch8_block = |ch8: &[i16]| -> Vec<[i16; 9]> {
+        ch8.iter()
+            .map(|&r| {
+                let mut row = [0i16; 9];
+                row[8] = r;
+                row
+            })
+            .collect()
     };
 
     // 1. Feed 160 ms of non-silent 48 kHz stereo audio and lock on the first 80 ms block.
@@ -561,16 +710,16 @@ fn aec_pipeline_resyncs_promptly_after_dac_drop() {
         }
     }
     ref_feed.feed(&stereo1);
-    let (dec1, bytes1) = encode_ch8_block(&ch8_1);
+    let dec1 = encode_ch8_block(&ch8_1);
     let mut fused = vec![0i16; UPLINK_FRAMES as usize];
-    let (_cleaned, locked1) = pipe.process(&dec1, &bytes1, &mut fused);
+    let (_cleaned, locked1) = pipe.process(&dec1, &mut fused);
     assert!(locked1, "first block must lock dealias");
     assert!(pipe.dealias_stats().locked);
 
     // 2. Simulate Stop -> hardware playback_flush() -> on_dac_drop() + silence blocks.
     ref_feed.on_dac_drop();
-    let (dec_z, bytes_z) = encode_ch8_block(&vec![0i16; UPLINK_FRAMES as usize]);
-    let (_cleaned_z, _locked_z) = pipe.process(&dec_z, &bytes_z, &mut fused);
+    let dec_z = encode_ch8_block(&vec![0i16; UPLINK_FRAMES as usize]);
+    let (_cleaned_z, _locked_z) = pipe.process(&dec_z, &mut fused);
 
     // 3. New play starts: feed new 48 kHz stereo audio and process its first 80 ms block.
     let mut stereo2 = Vec::with_capacity(2 * 7680);
@@ -584,8 +733,8 @@ fn aec_pipeline_resyncs_promptly_after_dac_drop() {
         }
     }
     ref_feed.feed(&stereo2);
-    let (dec2, bytes2) = encode_ch8_block(&ch8_2);
-    let (_cleaned2, locked2) = pipe.process(&dec2, &bytes2, &mut fused);
+    let dec2 = encode_ch8_block(&ch8_2);
+    let (_cleaned2, locked2) = pipe.process(&dec2, &mut fused);
     assert!(
         locked2,
         "must relock on the very first 80ms (<100ms) non-zero block after Stop"
@@ -815,4 +964,93 @@ fn apply_profile_respects_explicit_lx06_model_for_custom_device_id() {
     assert_eq!(cfg.playback_pcm, super::lx06::LX06_PLAY_PCM);
     assert_eq!(cfg.led_frame_path, super::lx06::LX06_LED_PATH);
     assert_eq!(cfg.button_devices, vec![super::lx06::LX06_BUTTON_DEV]);
+}
+
+#[test]
+fn board_identity_profile_version_and_audio_profile_distinguish_lx06_from_dot2() {
+    struct NoopHw;
+    impl Hardware for NoopHw {
+        fn capture_read(&self, _: &mut [u8], _: u32) -> io::Result<u32> {
+            Ok(0)
+        }
+        fn playback_write(&self, _: &[i16], frames: u32) -> io::Result<u32> {
+            Ok(frames)
+        }
+        fn playback_flush(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn playback_drain(&self) -> io::Result<()> {
+            Ok(())
+        }
+        fn playback_underruns(&self) -> u64 {
+            0
+        }
+        fn led_write(&self, _: &[(u8, u8, u8); 12]) -> io::Result<()> {
+            Ok(())
+        }
+        fn button_next(&self) -> io::Result<ButtonEvent> {
+            Err(io::Error::other("noop"))
+        }
+        fn wake_lock(&self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg_attr(not(feature = "board-lx06"), allow(unused_mut))]
+    let (mut role, _rx) = role::isolated_role(Arc::new(NoopHw));
+    // wifi=false must never report an SSID or declare the wifi capability.
+    assert!(!role.cfg.wifi);
+    assert!(!role.capabilities().iter().any(|c| c == "wifi"));
+    let desc = role.descriptor();
+    assert_eq!(desc.wifi_ssid, None);
+    #[cfg(all(feature = "board-lx06", not(feature = "board-dot2")))]
+    {
+        assert_eq!(desc.audio_profile, "lx06_shared_dmix");
+        assert_eq!(
+            crate::protocol::PROFILE_VERSION,
+            crate::protocol::LX06_PROFILE_VERSION
+        );
+    }
+    #[cfg(not(all(feature = "board-lx06", not(feature = "board-dot2"))))]
+    {
+        assert_eq!(desc.audio_profile, "fireos_builtin_speaker");
+        assert_eq!(
+            crate::protocol::PROFILE_VERSION,
+            crate::protocol::DOT2_PROFILE_VERSION
+        );
+    }
+
+    #[cfg(feature = "board-lx06")]
+    {
+        role.cfg
+            .apply_profile(profile::DeviceProfile::lx06(), false, false, false);
+        assert_eq!(role.descriptor().audio_profile, "lx06_shared_dmix");
+        match north_link::build_hello_frame(&role) {
+            GatewayFrame::Hello {
+                profile_version,
+                devices,
+                ..
+            } => {
+                assert_eq!(profile_version.as_deref(), Some("lx06-array-v1"));
+                assert_eq!(devices[0].audio_profile, "lx06_shared_dmix");
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
+        let mut ev = nearend::NearEndEvaluator::new("lx06", true, true)
+            .with_profile_version(crate::protocol::profile_version_for_model("LX06"));
+        let quiet = vec![15i16; 1280];
+        for i in 0..3 {
+            ev.evaluate(&quiet, false, true, None, false, i * 80, i * 80);
+        }
+        let loud: Vec<i16> = (0..1280)
+            .map(|i| (4000.0 * (i as f32 * 0.2).sin()) as i16)
+            .collect();
+        let out = ev.evaluate(&loud, false, true, None, false, 320, 1000);
+        match out.presence_frame.expect("presence emitted") {
+            GatewayFrame::NearEndPresence {
+                profile_version, ..
+            } => assert_eq!(profile_version, "lx06-array-v1"),
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
 }

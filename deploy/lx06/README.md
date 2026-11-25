@@ -1,15 +1,70 @@
-# LX06 idle wake selection
+# LX06 Deployment & Idle Wake Selection (256 MB Full vs 128 MB Thin Gateway)
 
-In the default mode, “小爱同学” wakes the stock assistant and the wake word configured in Home Mate starts a Home Mate turn. Say the command immediately after the wake word. Each assistant keeps its own conversation, follow-up and playback. A long hold of the Play/Pause key (1.5 seconds) pins the native assistant. Hold it again to return to dual wake. An old saved `xiaoai` selection migrates to dual wake on first boot.
+Xiaomi AI Speaker Pro (`LX06`) shipped in **two RAM hardware batches**: **256 MB** (`MemTotal ≈ 241 MiB`, `/tmp ≈ 120 MiB`) and **128 MB** (`MemTotal ≈ 118,760 kB`, `/tmp ≈ 59 MiB`). Check `grep ^MemTotal /proc/meminfo` over SSH before choosing a packaging mode. Both modes use non-invasive **Storage Scheme A** (`/data/hm` -> `/tmp/hm`) and never touch stock `mtd4` / `mtd5` SquashFS partitions.
 
-The stock microphone alias `noop` and speaker alias `plug:dmixer` on the tested LX06 firmware allow the stock assistant and Gateway to share the hardware. Gateway forwards idle keyword candidates through the existing Core protocol. Once Core accepts a Home wake, Gateway pauses the native wake service for that turn. A native dialog, ongoing playback, an unknown native state or a microphone mute prevents a new Home claim. The native touchpad continues to handle the physical mute and volume keys. An interrupted Home playback can leave audio already submitted to the shared mixer. Gateway reports the resulting flush as unconfirmed.
+## Mode 1: 256 MB RAM Full On-Device Dual Wake (`lx06-256m`)
 
-## Packaging
+In the default 256 MB mode, “小爱同学” wakes the stock assistant and the wake word configured in Home Mate starts a Home Mate turn. Say the command immediately after the wake word. Each assistant keeps its own conversation, follow-up and playback. A long hold of the Play/Pause key (1.5 seconds) pins the native assistant (`xiaoai-pinned`). Hold it again to return to dual wake (`homemate`). An old saved `xiaoai` selection migrates to dual wake on first boot.
 
-Build the gateway with `./tools/build_firmware_lx06.sh`. Pair the resulting AArch64 binary as `hm-gateway` inside the existing `hm-bundle.tar.xz` with the supervisor from this directory for a cold start. For serial 87, use the verified release Core, web assets, Silero model, and KWS driver, models and libraries. Package `deploy/lx06/kws-run.sh` as `run.sh` in the LX06 KWS archive. Store the KWS URL in `/data/hm/kws.url`, its lowercase SHA-256 in `/data/hm/kws.sha256`, and the main archive SHA-256 in `/data/hm/hm-bundle.sha256`. Preserve the board's unxz decoder. The launcher loads Silero from the main RAM bundle with gain 3 and 1 ms onset and silence durations. After boot, verify `devices[].mic.vad.endpoint.kind` is `gateway_vad` through `/api/v0/mode`. The supervisor checks the unpacked gateway's shared-audio contract before activation.
+The stock microphone alias `noop` and speaker alias `plug:dmixer` on the tested LX06 firmware allow the stock assistant and Gateway to share the hardware. Gateway forwards idle keyword candidates through the existing Core protocol (`127.0.0.1:8932`). Once Core accepts a Home wake, Gateway pauses the native wake service for that turn. A native dialog, ongoing playback, an unknown native state or a microphone mute prevents a new Home claim. The native touchpad continues to handle the physical mute and volume keys. An interrupted Home playback can leave audio already submitted to the shared mixer; Gateway reports the resulting flush as unconfirmed.
 
-The main archive in `/data/hm` expands into `/tmp/hm`. The separate KWS archive expands into `/tmp/hm-kws`. Both survive assistant selection and manual mode changes until reboot. A failed KWS download is retried from the configured URL. The native assistant stays available during startup subject to microphone mute. Run `python3 tools/test_lx06_supervisor.py` for the host-side cold boot, upgrade, retry and cache checks.
+### Packaging (256 MB Full Mode)
 
-## Device acceptance
+Build and pack with `./tools/pack_lx06_bundle.sh` (which runs `./tools/build_core.sh --slim`, `./tools/build_firmware_lx06.sh`, and enforces the `<= 6.0 MiB` `/data` UBIFS cap for `hm-bundle.tar.xz`). Pair the AArch64 `hm-gateway` with the `--slim` `hm-core`, compiled `web/` console assets, pinned `silero_vad.onnx`, and the separately hosted `hm-kws-lx06.tar.xz` archive (with `deploy/lx06/kws-run.sh` packed as `run.sh`). Store the KWS URL in `/data/hm/kws.url`, its lowercase SHA-256 in `/data/hm/kws.sha256`, and the main archive SHA-256 in `/data/hm/hm-bundle.sha256`. Preserve the board's static `/data/hm/unxz` decoder.
 
-On an owner-authorized LX06, record whether each wake word followed by a command in one breath reaches its intended assistant, including the first request after cold boot and after a manual mode change. Try the other wake word during each assistant's listening, follow-up and playback. Exercise physical and managed mute, volume and the long-press fallback, then check native wake resumes after a Home playback tail. Record cold-start and consecutive-turn latency, free RAM, CPU and shared audio underruns on the target unit before release.
+Install in one command:
+
+```sh
+./deploy/lx06/install-lx06.sh \
+  --device-ip 192.168.1.10 \
+  --kws-url http://192.168.1.50:18089/hm-kws-lx06.tar.xz
+```
+
+After boot, verify `devices[].mic.vad.endpoint.kind` is `gateway_vad` through `/api/v0/mode`. The supervisor checks the unpacked gateway's shared-audio contract (`lx06-idle-wake-v1`) before activation.
+
+## Mode 2: 128 MB RAM Thin Gateway (`lx06-128m`)
+
+> **Community credit**: Thanks to **@jiantongzh** for validating the 128 MB LX06 batch (`MemTotal ≈ 118,760 kB`, `/tmp tmpfs ≈ 59 MB`) and contributing the initial Thin Mode design.
+
+`deploy/lx06/init.sh` automatically enters **Thin Mode** when `HM_THIN_MODE=1`, `/data/hm/thin-mode` exists, **or** `/proc/meminfo` reports `MemTotal < 180000` kB (~180 MB).
+
+### Prerequisite: Full Docker `hm-core` on a LAN NAS / Server
+
+Thin Mode does **not** run `hm-core` or `hm-kws` on the speaker. You must run the **standard FULL Docker `hm-core`** image from [`yes999zc/home-mate`](https://github.com/yes999zc/home-mate) (`docker compose up -d --build`, `HM_GATEWAY_ALLOW_LAN=1`) on an always-on LAN NAS, server, or mini-PC. **Do NOT use the `--slim` Core build on your NAS/server** — the host has plenty of RAM/disk and supports in-process Silero VAD directly (place optional `./data/models/silero_vad.onnx`, otherwise Energy VAD fallback is used).
+
+### Packaging & Installation (128 MB Thin Mode)
+
+Pack the dedicated gateway-only archive (`hm-lx06-thin.tar.xz`, hard-capped `<= 1.5 MiB`, typically ~550 KB compressed / ~1.6 MiB unpacked — zero 12.6 MiB `hm-core` unpack spike on 59 MiB `/tmp`):
+
+```sh
+./tools/pack_lx06_bundle.sh --thin
+./deploy/lx06/install-lx06.sh \
+  --thin \
+  --device-ip 192.168.1.10 \
+  --core-addr 192.168.1.50:8932 \
+  --device-id lx06-room1
+```
+
+Configuration files under `/data/hm` in Thin Mode:
+- `/data/hm/thin-mode`: forces Thin Mode explicitly (also auto-detected when `MemTotal < 180000` kB).
+- `/data/hm/core.addr`: optional `<LAN_CORE_IP>:8932` (e.g. `192.168.1.50:8932`). When non-loopback, `init.sh` passes `--allow-lan-core` to `hm-gateway` (strictly limited to loopback + RFC 1918 + Tailscale `100.64/10` + IPv6 ULA `fc00::/7`; public internet IPs are always rejected). When absent, defaults to `127.0.0.1:8932` for an SSH reverse tunnel.
+- `/data/hm/core.token`: optional Core bearer token (`chmod 600`), passed via `HM_CORE_AUTH_TOKEN` environment variable into `Hello.auth_token` (never exposed in `/proc/<pid>/cmdline`). Omit for RFC 1918 / Tailscale IPv4 when `lan_gateway_exempt` is enabled in the Core Web Console; **required** for IPv6 ULA (`fc00::/7`) connections.
+- If a full `hm-bundle.tar.xz` is placed on a 128 MB unit instead of `hm-lx06-thin.tar.xz`, `init.sh` automatically removes `hm-core`, `web/`, and `silero_vad.onnx` immediately after unpacking.
+
+### Known Trade-offs of Thin Mode
+
+1. Depends on the LAN NAS/server and LAN/Wi-Fi stability (cannot operate autonomously when the host is offline).
+2. Local `hm-kws` is disabled to save ~27 MiB `/tmp` tmpfs and ~25 MiB RAM; wake runs via Core server-side ASR wake (`proactive_asr_wake`), adding slight wake latency plus continuous LAN PCM uplink traffic and host CPU/VAD/ASR load.
+3. In dual-wake coexistence with stock XiaoAi, local KWS cannot preempt stock `mipns-xiaomi` at the speaker edge.
+4. Audio and control traverse the LAN (direct `:8932` or SSH tunnel); Wi-Fi jitter can affect interrupt/stop responsiveness.
+
+## Verification & Device Acceptance
+
+Run host-side supervisor tests covering both 256 MB full mode and 128 MB thin mode (cold boot, cache reuse, thin bundle, full-bundle stripping, `core.addr`/`core.token`, and `< 180000 kB` auto-detection):
+
+```sh
+sh -n deploy/lx06/init.sh && sh -n deploy/lx06/install-lx06.sh && bash -n tools/pack_lx06_bundle.sh
+python3 tools/test_lx06_supervisor.py
+```
+
+On an owner-authorized LX06, record whether each wake word followed by a command in one breath reaches its intended assistant, including the first request after cold boot and after a manual mode change. Try the other wake word during each assistant's listening, follow-up and playback. Exercise physical and managed mute, volume and the long-press fallback, then check native wake resumes after a Home playback tail. Record cold-start and consecutive-turn latency, free RAM, `/tmp` usage, CPU and shared audio underruns on the target unit before release.

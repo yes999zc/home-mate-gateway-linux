@@ -89,18 +89,14 @@ impl Role {
         Some(String::from_utf8_lossy(&out.stdout).to_string())
     }
 
-    /// Associated SSID (wpa_state=COMPLETED), for the descriptor and the
-    /// watchdog's restore check.
-    pub fn wifi_current_ssid() -> Option<String> {
-        Self::wifi_status_text().and_then(|out| Self::ssid_from_status(&out))
-    }
+    const WIFI_STATUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
-    /// Raw `wpa_cli status` text — None when the command failed or produced
-    /// nothing (v1 mechanism #12: the probe must be able to tell "not
-    /// associated" from "I could not ask").
-    fn wifi_status_text() -> Option<String> {
-        let out = Self::wpa_cli(&["status"])?;
-        (!out.is_empty()).then_some(out)
+    /// Associated SSID (wpa_state=COMPLETED), for the descriptor and the
+    /// watchdog's restore check. Bounded so a stalled `wpa_supplicant` control
+    /// socket can never hang the single-threaded async runtime.
+    pub fn wifi_current_ssid() -> Option<String> {
+        Self::wifi_status_text_bounded(Self::WIFI_STATUS_TIMEOUT)
+            .and_then(|out| Self::ssid_from_status(&out))
     }
 
     /// Bounded `wpa_cli status` query for the background probe: spawns the

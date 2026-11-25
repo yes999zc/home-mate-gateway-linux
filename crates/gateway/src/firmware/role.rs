@@ -62,7 +62,7 @@ pub(super) struct Shared {
     #[cfg(feature = "board-lx06")]
     pub(super) vendor: Option<Arc<lx06_vendor::VendorMonitor>>,
     #[cfg(feature = "board-lx06")]
-    keyword_link: Option<u64>,
+    pub(super) keyword_link: Option<u64>,
     pub(super) mute_revision: u64,
     #[cfg(feature = "board-lx06")]
     pub(super) last_reported_mute: Option<bool>,
@@ -183,9 +183,9 @@ pub(super) struct Shared {
     pub(super) volume_cap: f64,
     pub(super) mix_gain: f32,
     pub(super) vad_threshold: f32,
-    pub(super) mic_gain_offset_db: Option<f32>,
     pub(super) config_journal: config_journal::ConfigJournal,
     pub(super) pending_eq_receipt: Option<PendingEqConfig>,
+    pub(super) pending_kws_receipt: Option<north_config::PendingKwsConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -217,33 +217,20 @@ impl Shared {
 /// The 2026-11-13 hang: the device stopped writing to the DAC while the
 /// process stayed up. Nothing in the firmware noticed, so the core waited for
 /// a `play_finished` that could never come. The playback thread publishes
-/// "a channel has live audio" plus "this write is outstanding, for THIS live
-/// set" and the async pump compares the age. A starve (live stream, no
-/// complete period yet, waiting for the next chunk) is deliberately NOT a
-/// stall: an outstanding write that cannot complete is the only trip.
+/// "this write is outstanding, for THIS live set" and the async pump compares
+/// the age. A starve (live stream, no complete period yet, waiting for the
+/// next chunk) is deliberately NOT a stall: an outstanding write that cannot
+/// complete is the only trip.
 #[derive(Default)]
 pub(crate) struct PlayProgress {
-    live_mask: std::sync::atomic::AtomicU8,
     /// Which channels were live when the OUTSTANDING write began (0 = the
-    /// idle silence clock). Recorded at the write site, never read from
-    /// `live_mask` later: the loop-top `set_live` runs BEFORE the command
-    /// queue is drained, so a stream whose very first period parks in
-    /// `playback_write` still reads mask 0 there — the first-write blind
-    /// spot that let a wedged play start go unseen (2026-11-13 M4).
+    /// idle silence clock), recorded at the write site.
     write_mask: std::sync::atomic::AtomicU8,
     want_write: std::sync::atomic::AtomicBool,
     at_ms: std::sync::atomic::AtomicU64,
 }
 
 impl PlayProgress {
-    pub(super) fn set_live(&self, idx: usize, live: bool) {
-        use std::sync::atomic::Ordering::Relaxed;
-        let bit = 1u8 << idx;
-        let cur = self.live_mask.load(Relaxed);
-        let next = if live { cur | bit } else { cur & !bit };
-        self.live_mask.store(next, Relaxed);
-    }
-
     /// Called immediately before EVERY DAC write (data period or silence
     /// clock), carrying the live set computed at the write site. Stamping
     /// here (not only on completion) is what makes a blocked ioctl visible:
@@ -265,7 +252,6 @@ impl PlayProgress {
         use std::sync::atomic::Ordering::{Relaxed, Release};
         self.want_write.store(false, Release);
         self.write_mask.store(0, Relaxed);
-        self.live_mask.store(0, Relaxed);
     }
 
     /// Channels blocked by a write that has not completed within `bound_ms`
@@ -412,13 +398,15 @@ fn keyword_level_source(shared: Arc<Mutex<Shared>>) -> kws::LevelSource {
 #[cfg(feature = "board-lx06")]
 pub(super) fn lx06_keyword_admission(shared: Arc<Mutex<Shared>>) -> kws::HitAdmission {
     Arc::new(move |word, suspected, retreat| {
-        let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
-        if sh.muted || sh.north_tx.is_none() {
-            return false;
-        }
+        let (vendor, link_gen) = {
+            let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if sh.muted || sh.north_tx.is_none() {
+                return false;
+            }
+            (sh.vendor.clone(), sh.link_gen)
+        };
         if word.trim() == "切换小爱" {
-            if sh.vendor.is_none() && !suspected {
-                drop(sh);
+            if vendor.is_none() && !suspected {
                 if let Err(error) =
                     lx06::select_mode(std::path::Path::new("/data/hm/mode"), "xiaoai-pinned")
                 {
@@ -429,7 +417,7 @@ pub(super) fn lx06_keyword_admission(shared: Arc<Mutex<Shared>>) -> kws::HitAdmi
             }
             return false;
         }
-        let Some(vendor) = &sh.vendor else {
+        let Some(vendor) = vendor else {
             return true;
         };
         let accepted = if suspected || retreat {
@@ -438,7 +426,11 @@ pub(super) fn lx06_keyword_admission(shared: Arc<Mutex<Shared>>) -> kws::HitAdmi
             vendor.observe_home_candidate()
         };
         if accepted {
-            sh.keyword_link = Some(sh.link_gen);
+            let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if sh.muted || sh.north_tx.is_none() || sh.link_gen != link_gen {
+                return false;
+            }
+            sh.keyword_link = Some(link_gen);
         }
         accepted
     })
@@ -482,19 +474,9 @@ impl Firmware {
         };
 
         let saved_acoustics = config_journal::load_acoustics(&cfg.state_dir);
-        let (volume_cap, mix_gain, vad_threshold, mic_gain_offset_db) = match saved_acoustics {
-            Some(ac) => (
-                ac.volume_cap,
-                ac.mix_gain,
-                ac.onset_threshold_dbfs,
-                ac.mic_gain_offset_db,
-            ),
-            None => (
-                cfg.volume_cap,
-                cfg.profile.mix_gain,
-                cfg.barge_in_db,
-                Some(cfg.profile.mic_gain_offset_db),
-            ),
+        let (volume_cap, mix_gain, vad_threshold) = match saved_acoustics {
+            Some(ac) => (ac.volume_cap, ac.mix_gain, ac.onset_threshold_dbfs),
+            None => (cfg.volume_cap, cfg.profile.mix_gain, cfg.barge_in_db),
         };
 
         let journal = config_journal::ConfigJournal::load(&cfg.state_dir);
@@ -552,9 +534,9 @@ impl Firmware {
                 volume_cap,
                 mix_gain,
                 vad_threshold,
-                mic_gain_offset_db,
                 config_journal: journal,
                 pending_eq_receipt: None,
+                pending_kws_receipt: None,
             })),
             seq: Arc::new(AtomicU64::new(0)),
             dropped_audio: Arc::new(AtomicU64::new(0)),
@@ -608,7 +590,7 @@ impl Firmware {
         #[cfg(feature = "board-lx06")]
         let vendor = (cfg.profile.model == "LX06"
             && std::env::var("HM_LX06_DUAL_WAKE").as_deref() == Ok("1"))
-        .then(|| lx06_vendor::VendorMonitor::start(muted));
+        .then(|| lx06_vendor::VendorMonitor::start(muted, cfg.kws));
         {
             let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
             sh.volume = vol;
@@ -664,18 +646,10 @@ impl Firmware {
         } else {
             (None, None)
         };
-        // No eager open: tracks are armed per diagnostic play (see
-        // probe_armed) so the steady path writes nothing to /run.
-        let (probe_play, probe_cap, probe_mics): (
-            Option<ProbeSink>,
-            Option<ProbeSink>,
-            Option<ProbeSink>,
-        ) = (None, None, None);
         let loopback_probe = cfg.loopback_probe;
         {
             let hw = hw.clone();
             let shared = shared.clone();
-            let mix_gain = cfg.profile.mix_gain;
             let loudness_on = cfg.loudness;
             let loudness_bass = cfg.loudness_bass;
             let loudness_curve = cfg.loudness_curve;
@@ -716,14 +690,12 @@ impl Firmware {
                     events_tx,
                     shared,
                     ref_feed,
-                    mix_gain,
                     loudness_on,
                     loudness_bass,
                     loudness_curve,
                     loudness_mbcl,
                     eq_bands,
                     loopback_probe,
-                    probe_play,
                     progress,
                     fault,
                     playback_alive,
@@ -755,11 +727,16 @@ impl Firmware {
         if cfg.wifi {
             spawn_wifi_probe(shared.clone(), hw.clone());
         }
-        let nearend = Arc::new(Mutex::new(nearend::NearEndEvaluator::new(
-            cfg.device_id.clone(),
-            cfg.aec,
-            super::core_addr_is_loopback(&cfg.core_addr),
-        )));
+        let nearend = Arc::new(Mutex::new(
+            nearend::NearEndEvaluator::new(
+                cfg.device_id.clone(),
+                cfg.aec,
+                super::core_addr_is_loopback(&cfg.core_addr),
+            )
+            .with_profile_version(crate::protocol::profile_version_for_model(
+                &cfg.profile.model,
+            )),
+        ));
         // KWS echo integrity outlives the optional semantic barge-in feature.
         // Capture keeps the same correlation source fresh without arming a
         // semantic onset when cfg.barge_in is false.
@@ -811,26 +788,33 @@ impl Firmware {
         let kws_feed = if cfg.kws {
             let shared_north = shared.clone();
             let north: kws::NorthSink = Arc::new(move |frame: GatewayFrame| {
-                #[cfg_attr(not(feature = "board-lx06"), allow(unused_mut))]
-                let mut sh = shared_north.lock().unwrap_or_else(|e| e.into_inner());
-                let Some(tx) = sh.north_tx.clone() else {
-                    return;
+                let (tx, gate) = {
+                    #[cfg_attr(not(feature = "board-lx06"), allow(unused_mut))]
+                    let mut sh = shared_north.lock().unwrap_or_else(|e| e.into_inner());
+                    let Some(tx) = sh.north_tx.clone() else {
+                        return;
+                    };
+                    #[cfg(feature = "board-lx06")]
+                    let gate = if matches!(frame, GatewayFrame::Keyword { .. }) {
+                        sh.vendor.clone().map(|v| {
+                            let same_link = sh.keyword_link.take() == Some(sh.link_gen);
+                            (v, sh.muted, same_link)
+                        })
+                    } else {
+                        None
+                    };
+                    #[cfg(not(feature = "board-lx06"))]
+                    let gate: Option<()> = None;
+                    (tx, gate)
                 };
                 #[cfg(feature = "board-lx06")]
-                if let Some(vendor) = sh
-                    .vendor
-                    .as_ref()
-                    .filter(|_| matches!(frame, GatewayFrame::Keyword { .. }))
-                {
-                    let allowed = !sh.muted && vendor.capture_allowed();
-                    let same_link = sh.keyword_link.take() == Some(sh.link_gen);
-                    if !allowed || !same_link {
+                if let Some((vendor, muted, same_link)) = gate {
+                    if muted || !same_link || !vendor.capture_allowed() {
                         return;
                     }
-                    tx.send_ctrl(frame);
-                    return;
                 }
-                drop(sh);
+                #[cfg(not(feature = "board-lx06"))]
+                let _ = gate;
                 tx.send_ctrl(frame);
             });
             let guard_shared = shared.clone();
@@ -856,62 +840,19 @@ impl Firmware {
             // Core alone applies per-unit arbitration calibration.
             let level = keyword_level_source(shared.clone());
             // Contract v2 §2.5 (#5): a retreat word cuts the audio HERE, in
-            // the spotter's reader thread, before the core is asked. The
-            // decision to close the session is still the core's; this only
-            // stops what is playing and starts the fact that proves it.
-            // Self-heard hits never reach this closure — the reader only
-            // calls it for hits the echo guard did NOT suspect.
+            // the spotter's reader thread, and defers `Keyword` until
+            // `FlushDone` emits `LocalExitFlushed` so Core receives the local
+            // flush strictly BEFORE `Keyword` closes the session.
             let exit_shared = shared.clone();
-            let on_retreat: kws::RetreatSink = Arc::new(move |keyword: &str, _fed_ms: u64| {
-                let now = now_ms();
-                let mut sh = exit_shared.lock().unwrap_or_else(|e| e.into_inner());
-                #[cfg(feature = "board-lx06")]
-                if sh.vendor.as_ref().is_some_and(|v| v.vendor_owns()) {
-                    return false;
-                }
-                if sh.local_exit.is_some() {
-                    // One episode at a time: a double detection must not
-                    // become two flushes or two facts.
-                    return false;
-                }
-                let voice_task = sh.active[0].as_ref().map(|(t, _)| t.clone());
-                let music_task = sh.active[1].as_ref().map(|(t, _)| t.clone());
-                let mask = LocalExit::channel_mask(
-                    sh.play_live,
-                    [voice_task.as_deref(), music_task.as_deref()],
-                );
-                if mask == 0 {
-                    // Nothing is playing: the exit is only a Report north,
-                    // and the core still closes the window from the keyword.
-                    fwlog!(
-                        "[firmware] local_exit_idle keyword={keyword} — nothing to flush (the keyword still goes north)"
-                    );
-                    return false;
-                }
-                let tx = sh.play_tx.clone();
-                sh.local_exit = Some(LocalExit {
-                    keyword: keyword.to_string(),
-                    fired_ms: now,
-                    flushed: mask,
-                    pending: mask,
-                    voice_task,
-                    music_task,
-                    flush_err: None,
+            let exit_device = cfg.device_id.clone();
+            let on_retreat: kws::RetreatSink =
+                Arc::new(move |keyword: &str, _fed_ms: u64, kw_frame: GatewayFrame| {
+                    north::handle_kws_retreat(&exit_shared, &exit_device, keyword, kw_frame)
                 });
-                if let Some(tx) = tx {
-                    if mask & 1 != 0 {
-                        sh.send_play(&tx, PlayAction::Flush(Chan::Voice));
-                    }
-                    if mask & 2 != 0 {
-                        sh.send_play(&tx, PlayAction::Flush(Chan::Music));
-                    }
-                }
-                drop(sh);
-                fwlog!(
-                    "[firmware] local_exit_start keyword={keyword} channels={:?} (core not consulted yet)",
-                    if mask == 1 { "voice" } else if mask == 2 { "music" } else { "voice+music" }
-                );
-                true
+            let lc_shared = shared.clone();
+            let lc_state_dir = cfg.state_dir.clone();
+            let on_lifecycle: kws::KwsLifecycleSink = Arc::new(move |ev| {
+                north_config::handle_kws_lifecycle(&lc_shared, &lc_state_dir, ev);
             });
             #[cfg(feature = "board-lx06")]
             let admit =
@@ -927,6 +868,7 @@ impl Firmware {
                 Some(level),
                 Some(on_retreat),
                 admit,
+                Some(on_lifecycle),
             );
             fwlog!(
                 "[kws] sidecar enabled: {} (cpu{})",
@@ -976,8 +918,6 @@ impl Firmware {
                     seq,
                     pipeline,
                     loopback_probe,
-                    probe_cap,
-                    probe_mics,
                     kws_feed,
                     barge,
                     nearend,
@@ -1145,7 +1085,7 @@ impl Role {
     /// mid-stream and reported an old task's terminal facts into a new
     /// generation.
     pub(super) fn teardown_link(&self) {
-        let (had_audio, cleared) = {
+        let (had_audio, cleared, vendor) = {
             let mut sh = lock_or_fault(&self.shared, Some(&self.fault), "teardown.shared");
             let cleared = (sh.active[0].is_some() as u8)
                 + (sh.active[1].is_some() as u8)
@@ -1164,19 +1104,24 @@ impl Role {
             sh.decode_gen[0] = sh.decode_gen[0].wrapping_add(1);
             sh.decode_gen[1] = sh.decode_gen[1].wrapping_add(1);
             #[cfg(feature = "board-lx06")]
-            {
+            let vendor = {
                 sh.last_reported_mute = None;
-            }
-            #[cfg(feature = "board-lx06")]
-            if let Some(vendor) = &sh.vendor {
-                vendor.set_playback_active(false);
-                vendor.assistant_state("offline");
-                self.hw
-                    .set_home_indicator(super::lx06::IndicatorOwner::Native);
-            }
+                sh.vendor.clone()
+            };
+            #[cfg(not(feature = "board-lx06"))]
+            let vendor: Option<()> = None;
             sh.link_gen = sh.link_gen.wrapping_add(1);
-            (cleared > 0, cleared)
+            (cleared > 0, cleared, vendor)
         };
+        #[cfg(feature = "board-lx06")]
+        if let Some(vendor) = vendor {
+            vendor.set_playback_active(false);
+            vendor.assistant_state("offline");
+            self.hw
+                .set_home_indicator(super::lx06::IndicatorOwner::Native);
+        }
+        #[cfg(not(feature = "board-lx06"))]
+        let _ = vendor;
         let streams = std::mem::take(&mut *lock_or_fault(
             &self.streams,
             Some(&self.fault),
@@ -1202,7 +1147,7 @@ impl Role {
         }
     }
 
-    pub(super) fn descriptor(&self) -> HelloDevice {
+    pub(super) fn capabilities(&self) -> Vec<String> {
         let mut capabilities = vec![
             "audio_in".into(),
             "audio_out".into(),
@@ -1214,34 +1159,68 @@ impl Role {
             // declared so the core sends it (and old cores, which never
             // send it, stay window-safe either way).
             "remote_mute".into(),
-            // v1 mechanism (#14, 2026-11-16): the interrupt contract of THIS
-            // build, as formal capability tokens — wake words + the retreat
-            // set's LOCAL exit. Nothing else may cut audio (half duplex).
-            "local_exit".into(),
-            "interrupt_wake_word".into(),
-            "interrupt_retreat_local_exit".into(),
-            // Stage 2 M2.1 (`config_apply_v2` / #112 / #113): typed effective
-            // configuration protocol with durable idempotent receipts.
-            "config_apply_v2".into(),
-            "config_block_kws".into(),
+        ];
+        // v1 mechanism (#14, 2026-11-16): only declare local KWS / retreat
+        // interrupt capabilities when the local KWS sidecar is actually enabled
+        // (`self.cfg.kws`); thin gateways without local KWS must not advertise
+        // them or invite KWS config pushes.
+        if self.cfg.kws {
+            capabilities.extend([
+                "local_exit".into(),
+                "interrupt_wake_word".into(),
+                "interrupt_retreat_local_exit".into(),
+            ]);
+        }
+        // Stage 2 M2.1 (`config_apply_v2` / #112 / #113): typed effective
+        // configuration protocol with durable idempotent receipts.
+        capabilities.push("config_apply_v2".into());
+        if self.cfg.kws {
+            capabilities.push("config_block_kws".into());
+        }
+        capabilities.extend([
             "config_block_audio_eq".into(),
             "config_block_led".into(),
             "config_block_duplex".into(),
             "config_block_acoustics".into(),
-        ];
+        ]);
         // v0.2.3: online wifi change (WifiConfig frame + watchdog) — only a
         // radio-carrying form declares it; a radio-less build refuses the
         // frame as a protocol error instead of executing it.
         if self.cfg.wifi {
             capabilities.push("wifi".into());
         }
+        capabilities
+    }
+
+    pub(super) fn audio_profile(&self) -> &'static str {
+        #[cfg(all(feature = "board-lx06", not(feature = "board-dot2")))]
+        {
+            "lx06_shared_dmix"
+        }
+        #[cfg(not(all(feature = "board-lx06", not(feature = "board-dot2"))))]
+        {
+            if self.cfg.profile.model.eq_ignore_ascii_case("LX06")
+                || self.cfg.model.eq_ignore_ascii_case("LX06")
+            {
+                "lx06_shared_dmix"
+            } else {
+                "fireos_builtin_speaker"
+            }
+        }
+    }
+
+    pub(super) fn descriptor(&self) -> HelloDevice {
         HelloDevice {
             stable_id: self.cfg.device_id.clone(),
             model: self.cfg.model.clone(),
             firmware: Some(self.cfg.version.clone()),
-            capabilities,
-            audio_profile: "fireos_builtin_speaker".into(),
-            wifi_ssid: Self::wifi_current_ssid(),
+            capabilities: self.capabilities(),
+            audio_profile: self.audio_profile().into(),
+            wifi_ssid: if self.cfg.wifi {
+                Self::wifi_current_ssid()
+            } else {
+                None
+            },
         }
     }
 
@@ -1258,6 +1237,7 @@ impl Role {
     /// One watchdog tick: the DAC write gate plus the capture heartbeat.
     /// Both are "audio is gone" facts; the pump turns either into an exit.
     pub(super) fn watch_audio(&self) {
+        self.watch_local_flush_locks();
         self.watch_wifi_provisioning();
         self.watch_playback();
         if self.cfg.capture_watchdog_ms == 0 {
@@ -1303,7 +1283,11 @@ impl Role {
         };
         if expired {
             render_ring(&self.shared, &self.hw);
-            let ssid = Self::wifi_current_ssid().unwrap_or_default();
+            let ssid = if self.cfg.wifi {
+                Self::wifi_current_ssid().unwrap_or_default()
+            } else {
+                String::new()
+            };
             let detail = format!(
                 "provisioning timeout after {}ms; kept existing network",
                 self.cfg.wifi_provisioning_timeout_ms
@@ -1366,7 +1350,6 @@ impl Role {
                 sh.pending_stop[idx] = None;
                 (slot, sh.played[idx])
             };
-            self.progress.set_live(idx, false);
             let Some((task_id, expected_ms)) = slot else {
                 continue;
             };

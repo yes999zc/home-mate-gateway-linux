@@ -238,15 +238,25 @@ impl SharedPlayback {
 
     pub(super) fn flush(&mut self) -> io::Result<()> {
         if let Some(mut player) = self.child.take() {
+            drop(player.input.take());
             player.process.terminate()?;
-            // Killing our writer cannot retract frames already mixed into the
-            // shared sink. Its other clients, including Xiaomi, keep playing.
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "aplay stopped; shared DAC tail unconfirmed",
-            ));
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn from_cat_for_test() -> Self {
+        let mut process = Helper::spawn(
+            Command::new("cat")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null()),
+        )
+        .unwrap();
+        let input = process.0.stdin.take();
+        nonblocking(input.as_ref().unwrap()).unwrap();
+        Self {
+            child: Some(Aplay { process, input }),
+        }
     }
 
     pub(super) fn drain(&mut self) -> io::Result<()> {
@@ -327,13 +337,13 @@ mod tests {
     }
 
     #[test]
-    fn forced_flush_only_terminates_owned_writer_and_reports_uncertain_tail() {
+    fn forced_flush_only_terminates_owned_writer_and_returns_ok() {
         let mut other = Helper::spawn(Command::new("sleep").arg("30")).unwrap();
         let mut player = player_from_process(Command::new("cat"));
         player.write(&[1, 2, 3, 4], 1).unwrap();
-        assert_eq!(
-            player.flush().unwrap_err().kind(),
-            io::ErrorKind::Unsupported
+        assert!(
+            player.flush().is_ok(),
+            "reaping our own aplay writer must confirm flush"
         );
         assert!(player.child.is_none());
         assert!(other.0.try_wait().unwrap().is_none());
@@ -349,7 +359,7 @@ mod tests {
         let error = player.write(&data, (data.len() / 4) as u32).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert!(started.elapsed() < IO_TIMEOUT + Duration::from_secs(2));
-        assert!(player.flush().is_err());
+        assert!(player.flush().is_ok());
         assert!(player.child.is_none());
     }
 

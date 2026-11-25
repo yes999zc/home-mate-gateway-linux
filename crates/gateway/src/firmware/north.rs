@@ -1,12 +1,271 @@
 use super::*;
 
+pub(super) struct SettledOnGenBump {
+    pub(super) pending_stop: Option<String>,
+    pub(super) local_exit: Option<LocalExit>,
+}
+
+impl Shared {
+    /// Bump `decode_gen[idx]` and settle any in-flight flush waiters whose
+    /// `FlushDone` will now be dropped as stale (`pending_stop[idx]`,
+    /// `local_stop` on Voice, and `local_exit` bit `idx`).
+    pub(super) fn bump_decode_gen(
+        &mut self,
+        idx: usize,
+        keep_pending_for: Option<&str>,
+    ) -> SettledOnGenBump {
+        self.decode_gen[idx] = self.decode_gen[idx].wrapping_add(1);
+        let pending_stop = match self.pending_stop[idx].take() {
+            Some(task) if keep_pending_for == Some(task.as_str()) => None,
+            other => other,
+        };
+        if idx == 0 {
+            self.local_stop = None;
+        }
+        let mut local_exit = None;
+        if let Some(ex) = self.local_exit.as_mut() {
+            ex.pending &= !(1u8 << idx);
+            if ex.pending == 0 {
+                local_exit = self.local_exit.take();
+            }
+        }
+        SettledOnGenBump {
+            pending_stop,
+            local_exit,
+        }
+    }
+}
+
+pub(super) fn handle_kws_retreat(
+    shared: &Arc<Mutex<Shared>>,
+    device_id: &str,
+    keyword: &str,
+    kw_frame: GatewayFrame,
+) -> Option<GatewayFrame> {
+    let now = now_ms();
+    #[cfg(feature = "board-lx06")]
+    {
+        let vendor = shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .vendor
+            .clone();
+        if vendor.as_ref().is_some_and(|v| v.vendor_owns()) {
+            return Some(kw_frame);
+        }
+    }
+    let (stale_exit, north_tx, result) = {
+        let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let stale_exit = if sh
+            .local_exit
+            .as_ref()
+            .is_some_and(|ex| now.saturating_sub(ex.fired_ms) >= LOCAL_FLUSH_LOCK_TIMEOUT_MS)
+        {
+            fwlog!(
+                "[firmware] expiring stale local_exit marker (> {LOCAL_FLUSH_LOCK_TIMEOUT_MS}ms)"
+            );
+            sh.local_exit.take()
+        } else {
+            None
+        };
+        let north_tx = sh.north_tx.clone();
+        if sh.local_exit.is_some() {
+            // One episode at a time: a double detection must not become two
+            // flushes or two facts.
+            (stale_exit, north_tx, Some(kw_frame))
+        } else {
+            let voice_task = sh.active[0].as_ref().map(|(t, _)| t.clone());
+            let music_task = sh.active[1].as_ref().map(|(t, _)| t.clone());
+            let mask = LocalExit::channel_mask(
+                sh.play_live,
+                [voice_task.as_deref(), music_task.as_deref()],
+            );
+            let tx = sh.play_tx.clone();
+            if mask == 0 || tx.is_none() {
+                fwlog!(
+                    "[firmware] local_exit_idle keyword={keyword} — nothing to flush (the keyword still goes north)"
+                );
+                (stale_exit, north_tx, Some(kw_frame))
+            } else {
+                #[cfg(feature = "board-lx06")]
+                {
+                    let _ = sh.keyword_link.take();
+                }
+                sh.local_exit = Some(LocalExit {
+                    keyword: keyword.to_string(),
+                    fired_ms: now,
+                    flushed: mask,
+                    pending: mask,
+                    voice_task,
+                    music_task,
+                    flush_err: None,
+                    deferred_keyword: Some(kw_frame),
+                });
+                if let Some(tx) = tx {
+                    if mask & 1 != 0 {
+                        sh.send_play(&tx, PlayAction::Flush(Chan::Voice));
+                    }
+                    if mask & 2 != 0 {
+                        sh.send_play(&tx, PlayAction::Flush(Chan::Music));
+                    }
+                }
+                fwlog!(
+                    "[firmware] local_exit_start keyword={keyword} channels={:?} (core not consulted yet)",
+                    if mask == 1 {
+                        "voice"
+                    } else if mask == 2 {
+                        "music"
+                    } else {
+                        "voice+music"
+                    }
+                );
+                (stale_exit, north_tx, None)
+            }
+        }
+    };
+    if let (Some(ex), Some(tx)) = (stale_exit, north_tx) {
+        let latency_ms = now.saturating_sub(ex.fired_ms);
+        let channels = ex.channels();
+        tx.send_ctrl(GatewayFrame::LocalExitFlushed {
+            device: device_id.to_string(),
+            keyword: ex.keyword,
+            ts: ex.fired_ms,
+            latency_ms,
+            channels,
+            detail: ex
+                .flush_err
+                .map(|e| format!("flush_failed: {e}"))
+                .or_else(|| Some("flush_timeout".into())),
+        });
+        if let Some(kw) = ex.deferred_keyword {
+            tx.send_ctrl(kw);
+        }
+    }
+    result
+}
+
 impl Role {
+    pub(super) fn mode_report_frame(&self, requested: String, effective: String) -> GatewayFrame {
+        let (layout, _) = self.mic_layout();
+        GatewayFrame::ModeReport {
+            device: self.cfg.device_id.clone(),
+            duplex: DuplexState {
+                capability: "half".into(),
+                requested,
+                negotiated: "half".into(),
+                effective,
+            },
+            aec: AecState {
+                owner: if self.cfg.aec { "device" } else { "none" }.into(),
+                reference: if layout == "mic_ref" {
+                    "available".into()
+                } else {
+                    "absent".into()
+                },
+            },
+        }
+    }
+
+    pub(super) fn emit_settled_on_gen_bump(
+        &self,
+        settled: SettledOnGenBump,
+        direct_tx: Option<&NorthTx>,
+    ) {
+        let send = |frame: GatewayFrame| {
+            if let Some(tx) = direct_tx {
+                tx.send_ctrl(frame);
+            } else {
+                self.north(frame);
+            }
+        };
+        if let Some(task_id) = settled.pending_stop {
+            fwlog!("[firmware] settling superseded pending_stop for {task_id} on decode_gen bump");
+            send(GatewayFrame::StopReceipt {
+                task_id,
+                stage: "device_confirmed".into(),
+                played_ms: None,
+                consumed_ms: None,
+                progress_basis: None,
+                detail: None,
+            });
+        }
+        if let Some(ex) = settled.local_exit {
+            let latency_ms = now_ms().saturating_sub(ex.fired_ms);
+            let channels = ex.channels();
+            fwlog!(
+                "[firmware] local_exit_flushed (settled on decode_gen bump) keyword={} channels={:?} latency_ms={latency_ms}",
+                ex.keyword,
+                channels
+            );
+            send(GatewayFrame::LocalExitFlushed {
+                device: self.cfg.device_id.clone(),
+                keyword: ex.keyword,
+                ts: ex.fired_ms,
+                latency_ms,
+                channels,
+                detail: ex.flush_err.map(|e| format!("flush_failed: {e}")),
+            });
+            if let Some(kw) = ex.deferred_keyword {
+                send(kw);
+            }
+        }
+    }
+
+    pub(super) fn watch_local_flush_locks(&self) {
+        self.watch_pending_kws_receipt();
+        let now = now_ms();
+        let expired_exit = {
+            let mut sh = lock_or_fault(&self.shared, Some(&self.fault), "role.shared");
+            if sh
+                .local_stop
+                .as_ref()
+                .is_some_and(|(_, at)| now.saturating_sub(*at) >= LOCAL_FLUSH_LOCK_TIMEOUT_MS)
+            {
+                fwlog!(
+                    "[barge-in] expiring stale local_stop marker (>= {LOCAL_FLUSH_LOCK_TIMEOUT_MS}ms)"
+                );
+                sh.local_stop = None;
+            }
+            if sh
+                .local_exit
+                .as_ref()
+                .is_some_and(|ex| now.saturating_sub(ex.fired_ms) >= LOCAL_FLUSH_LOCK_TIMEOUT_MS)
+            {
+                sh.local_exit.take()
+            } else {
+                None
+            }
+        };
+        if let Some(ex) = expired_exit {
+            let latency_ms = now.saturating_sub(ex.fired_ms);
+            let channels = ex.channels();
+            fwlog!(
+                "[firmware] expiring stale local_exit marker keyword={} after {latency_ms}ms",
+                ex.keyword
+            );
+            self.north(GatewayFrame::LocalExitFlushed {
+                device: self.cfg.device_id.clone(),
+                keyword: ex.keyword,
+                ts: ex.fired_ms,
+                latency_ms,
+                channels,
+                detail: ex
+                    .flush_err
+                    .map(|e| format!("flush_failed: {e}"))
+                    .or_else(|| Some("flush_timeout".into())),
+            });
+            if let Some(kw) = ex.deferred_keyword {
+                self.north(kw);
+            }
+        }
+    }
+
     /// #23: Owner-confirmed long-press mute behavior: enter local Wi-Fi
     /// provisioning notice state, stop any current playback, reject incoming
     /// Play/PlayBegin, light the provisioning LED ring, notify core, and
     /// NEVER trigger a factory reset.
     fn enter_wifi_provisioning_notice(&self, ms: u64) {
-        {
+        let (settled_v, settled_m) = {
             let mut sh = lock_or_fault(&self.shared, Some(&self.fault), "wifi_setup.shared");
             sh.wifi_provisioning = true;
             sh.wifi_provisioning_until_ms = if self.cfg.wifi_provisioning_timeout_ms > 0 {
@@ -15,12 +274,13 @@ impl Role {
                 None
             };
             sh.active = [None, None];
-            sh.pending_stop = [None, None];
-            sh.local_stop = None;
             sh.play_live = [false, false];
-            sh.decode_gen[0] = sh.decode_gen[0].wrapping_add(1);
-            sh.decode_gen[1] = sh.decode_gen[1].wrapping_add(1);
-        }
+            let sv = sh.bump_decode_gen(0, None);
+            let sm = sh.bump_decode_gen(1, None);
+            (sv, sm)
+        };
+        self.emit_settled_on_gen_bump(settled_v, None);
+        self.emit_settled_on_gen_bump(settled_m, None);
         lock_or_fault(&self.streams, Some(&self.fault), "wifi_setup.streams").clear();
         self.progress.clear();
         self.flush_play(Chan::Voice);
@@ -194,11 +454,14 @@ impl Role {
             device, task_id, ..
         } = &frame
         {
-            let sh = lock_or_fault(&self.shared, Some(&self.fault), "play.shared");
-            if device == &self.cfg.device_id
-                && sh.vendor.as_ref().is_some_and(|v| v.native_blocks_play())
-            {
-                drop(sh);
+            let vendor = (device == &self.cfg.device_id)
+                .then(|| {
+                    lock_or_fault(&self.shared, Some(&self.fault), "play.shared")
+                        .vendor
+                        .clone()
+                })
+                .flatten();
+            if vendor.as_ref().is_some_and(|v| v.native_blocks_play()) {
                 direct_tx.send_ctrl(GatewayFrame::PlayReceipt {
                     task_id: task_id.clone(),
                     stage: "failed".into(),
@@ -237,12 +500,28 @@ impl Role {
                         q: b.q.clamp(0.3, 8.0),
                     })
                     .collect();
-                {
+                let superseded_frame = {
                     let mut sh =
                         lock_or_fault(&self.shared, Some(&self.fault), "on_core_frame.shared");
                     sh.eq_curve = Some(curve);
                     sh.eq_bands = bands.clone();
                     sh.eq_rev = sh.eq_rev.wrapping_add(1);
+                    let rev = sh.eq_rev;
+                    sh.pending_eq_receipt.take().map(|old| {
+                        let mut r = old.receipt;
+                        r.status = crate::protocol::ConfigReceiptStatus::Superseded;
+                        r.active_hash = None;
+                        r.active_values = None;
+                        r.error_code = Some("superseded_by_legacy_audio_eq".into());
+                        r.evidence = Some(serde_json::json!({ "superseded_by_eq_rev": rev }));
+                        r.retryable = false;
+                        sh.config_journal.record_terminal(&r, None);
+                        let _ = sh.config_journal.save(&self.cfg.state_dir);
+                        r.into_frame()
+                    })
+                };
+                if let Some(frame) = superseded_frame {
+                    let _ = direct_tx.send_ctrl(frame);
                 }
                 fwlog!(
                     "[loudness] audio_eq applied: curve={:?} bands={} ({})",
@@ -303,13 +582,14 @@ impl Role {
                 let idx = if chan == Chan::Voice { 0 } else { 1 };
                 // A new play on the same channel displaces the active one.
                 self.supersede(chan, "superseded by a new play", direct_tx);
-                let stamp = {
+                let (stamp, settled) = {
                     let mut sh =
                         lock_or_fault(&self.shared, Some(&self.fault), "on_core_frame.shared");
-                    sh.decode_gen[idx] = sh.decode_gen[idx].wrapping_add(1);
+                    let settled = sh.bump_decode_gen(idx, None);
                     sh.active[idx] = Some((task_id.clone(), 0));
-                    sh.stamp(chan)
+                    (sh.stamp(chan), settled)
                 };
+                self.emit_settled_on_gen_bump(settled, Some(direct_tx));
                 return Ok(Some(DecodeCmd::Play {
                     task_id,
                     chan,
@@ -374,13 +654,14 @@ impl Role {
                 // was doing (same rule as whole plays), and takes over the
                 // channel slot so StreamDone still reaches the right task.
                 self.supersede(chan, "superseded by a new stream", direct_tx);
-                let (played_base, stamp) = {
+                let (played_base, stamp, settled) = {
                     let mut sh =
                         lock_or_fault(&self.shared, Some(&self.fault), "on_core_frame.shared");
-                    sh.decode_gen[idx] = sh.decode_gen[idx].wrapping_add(1);
+                    let settled = sh.bump_decode_gen(idx, None);
                     sh.active[idx] = Some((task_id.clone(), 0));
-                    (sh.played[idx], sh.stamp(chan))
+                    (sh.played[idx], sh.stamp(chan), settled)
                 };
+                self.emit_settled_on_gen_bump(settled, Some(direct_tx));
                 {
                     let mut streams =
                         lock_or_fault(&self.streams, Some(&self.fault), "on_core_frame.streams");
@@ -475,7 +756,7 @@ impl Role {
                     .remove(&task_id);
                 // The stop owns any play with this task id; unknown ids stop
                 // cleanly (nothing was playing under that name).
-                let flush_chan = {
+                let (flush_chan, settled) = {
                     let mut sh =
                         lock_or_fault(&self.shared, Some(&self.fault), "on_core_frame.shared");
                     let idx = sh
@@ -483,19 +764,22 @@ impl Role {
                         .iter()
                         .position(|a| a.as_ref().map(|(t, _)| t == &task_id) == Some(true));
                     if let Some(i) = idx {
-                        sh.decode_gen[i] = sh.decode_gen[i].wrapping_add(1);
+                        let settled = sh.bump_decode_gen(i, Some(&task_id));
                         if flush {
                             sh.pending_stop[i] = Some(task_id.clone());
                             let chan = if i == 0 { Chan::Voice } else { Chan::Music };
                             sh.send_play(&self.play_tx, PlayAction::Flush(chan));
-                            Some(chan)
+                            (Some(chan), Some(settled))
                         } else {
-                            None
+                            (None, Some(settled))
                         }
                     } else {
-                        None
+                        (None, None)
                     }
                 };
+                if let Some(settled) = settled {
+                    self.emit_settled_on_gen_bump(settled, Some(direct_tx));
+                }
                 if flush_chan.is_some() {
                     // The receipt belongs to the hardware fact, so it
                     // leaves from FlushDone (after playback_flush), with
@@ -669,26 +953,8 @@ impl Role {
                     sh.duplex_requested = duplex_requested.clone();
                     sh.duplex_effective = "half".into();
                 }
-                let (layout, _) = self.mic_layout();
-                let _ = direct_tx.send_ctrl(GatewayFrame::ModeReport {
-                    device: self.cfg.device_id.clone(),
-                    duplex: DuplexState {
-                        capability: "half".into(),
-                        requested: duplex_requested,
-                        negotiated: "half".into(),
-                        effective: "half".into(),
-                    },
-                    aec: AecState {
-                        // M6b: EchoMuse AEC runs in the firmware audio
-                        // thread; the core is a consumer, not the owner.
-                        owner: "device".into(),
-                        reference: if layout == "mic_ref" {
-                            "available".into()
-                        } else {
-                            "absent".into()
-                        },
-                    },
-                });
+                let _ =
+                    direct_tx.send_ctrl(self.mode_report_frame(duplex_requested, "half".into()));
             }
             CoreFrame::MicSession { device, action, .. } => {
                 if device != self.cfg.device_id {
@@ -796,7 +1062,7 @@ impl Role {
                 // does not declare `wifi` must NOT silently execute a WiFi
                 // change — that is a protocol error (lamp + disconnect),
                 // exactly the acceptance line gateway issue #11 asks for.
-                if !self.descriptor().capabilities.iter().any(|c| c == "wifi") {
+                if !self.capabilities().iter().any(|c| c == "wifi") {
                     fwlog!("[firmware] WifiConfig refused: wifi not declared in the descriptor");
                     {
                         let mut sh = lock_or_fault(&self.shared, Some(&self.fault), "role.shared");
@@ -963,13 +1229,15 @@ impl Role {
                 fwlog!("[lx06] native mic mute unconfirmed");
                 return;
             }
+            #[cfg(feature = "board-lx06")]
+            let native_muted = !managed && vendor.as_ref().is_some_and(|v| v.native_muted_now());
             #[cfg_attr(not(feature = "board-lx06"), allow(unused_mut))]
             let mut sh = lock_or_fault(&role.shared, Some(&role.fault), "mute.shared");
             if generation != sh.link_gen || revision != sh.mute_revision || sh.muted != managed {
                 return;
             }
             #[cfg(feature = "board-lx06")]
-            let muted = managed || vendor.as_ref().is_some_and(|v| v.native_muted_now());
+            let muted = managed || native_muted;
             #[cfg(not(feature = "board-lx06"))]
             let muted = managed;
             let Some(tx) = sh.north_tx.clone() else {
@@ -1064,14 +1332,14 @@ impl Role {
     pub(super) fn led_tick(&self) {
         #[cfg(feature = "board-lx06")]
         {
-            let native_mute_changed = {
+            let (muted, vendor, last_reported) = {
                 let sh = lock_or_fault(&self.shared, Some(&self.fault), "mute.shared");
-                !sh.muted
-                    && sh.vendor.as_ref().is_some_and(|v| {
-                        sh.last_reported_mute
-                            .is_some_and(|last| last != v.native_muted_now())
-                    })
+                (sh.muted, sh.vendor.clone(), sh.last_reported_mute)
             };
+            let native_mute_changed = !muted
+                && vendor.as_ref().is_some_and(|v| {
+                    last_reported.is_some_and(|last| last != v.native_muted_now())
+                });
             if native_mute_changed {
                 self.report_mute(false, None, "native_mute");
             }
@@ -1118,17 +1386,16 @@ impl Role {
 /// both the `Firmware` methods and the northbound tasks (which hold a
 /// `Role`) call it.
 pub(super) fn render_ring(shared: &std::sync::Mutex<Shared>, hw: &std::sync::Arc<dyn Hardware>) {
-    let (frame, fade_done) = {
-        let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+    let (frame, vendor_sync) = {
+        let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(feature = "board-lx06")]
-        if let Some(vendor) = &sh.vendor {
+        let vendor_sync = sh.vendor.clone().map(|vendor| {
             let active =
                 sh.active.iter().any(Option::is_some) || sh.play_live.iter().any(|live| *live);
-            if !active || vendor.home_owns() {
-                vendor.set_playback_active(active);
-            }
-            hw.set_home_indicator(vendor.indicator_owner());
-        }
+            (vendor, active)
+        });
+        #[cfg(not(feature = "board-lx06"))]
+        let vendor_sync: Option<()> = None;
         let fade = sh.led_fade.map(|(from, started)| {
             (
                 from,
@@ -1156,12 +1423,22 @@ pub(super) fn render_ring(shared: &std::sync::Mutex<Shared>, hw: &std::sync::Arc
             leds::minute_of_day_now_with_offset(sh.led_tz_offset_minutes),
             sh.led_orientation,
         );
-        let fade_done = matches!(fade, Some((_, e)) if e >= leds::CLOSE_FADE_MS);
-        (frame, fade_done)
+        if matches!(fade, Some((_, e)) if e >= leds::CLOSE_FADE_MS) {
+            sh.led_fade = None;
+        }
+        (frame, vendor_sync)
     };
-    if fade_done {
-        shared.lock().unwrap_or_else(|e| e.into_inner()).led_fade = None;
+    // Perform synchronous fs::metadata / I2C sysfs indicator handoff AFTER
+    // releasing `shared.lock()` so real-time audio/KWS threads never stall.
+    #[cfg(feature = "board-lx06")]
+    if let Some((vendor, active)) = vendor_sync {
+        if !active || vendor.home_owns() {
+            vendor.set_playback_active(active);
+        }
+        hw.set_home_indicator(vendor.indicator_owner());
     }
+    #[cfg(not(feature = "board-lx06"))]
+    let _ = vendor_sync;
     if let Err(e) = hw.led_write(&frame) {
         fwlog!("[firmware] led write failed: {e}");
     }

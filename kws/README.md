@@ -18,10 +18,11 @@ The gateway reports; the core decides — for every word EXCEPT the deployed
 retreat set. Those cut the audio LOCALLY first (contract v0.5 local exit, the
 only local audio action the KWS has; physical mute, volume and link teardown
 are separate local behaviors that never went through the spotter): hit → both
-channels flushed (≤300 ms from the hit, measured at the hardware flush), the
-`Keyword` fact and the `LocalExitFlushed` fact travel north as each is ready
-(the contract test accepts either order), and the SESSION itself is still
-closed only by the core. A false WAKE-word positive therefore never stops or
+channels flushed (≤300 ms from the hit, measured at the hardware flush), then
+`LocalExitFlushed` is sent north strictly before the retreat `Keyword` fact
+(when playback is active; idle retreat hits emit `Keyword` immediately with no
+flush), and the SESSION itself is still closed only by the core. A false
+WAKE-word positive therefore never stops or
 starts anything on its own; a false retreat-word positive costs one silence,
 never a semantics execution.
 
@@ -50,7 +51,7 @@ the bundled Debian loader (same trick as the KWS spike, 2026-11-10).
   libsherpa-onnx-c-api.so  libonnxruntime.so
   model/{encoder…chunk-16…int8.onnx, decoder…onnx, joiner…int8.onnx, tokens.txt}
   kw.txt      # n ǐ h ǎo g āo d á @你好高达
-  run.sh      # exec loader --library-path . ./hm-kws … (see deploy/dot2d/kws)
+  run.sh      # exec loader --library-path . ./hm-kws … (canonical script: kws/run.sh)
 ```
 
 ~25 MB on /data. The firmware spawns `run.sh` with `KWS_CPU` (default 3) and

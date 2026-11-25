@@ -15,6 +15,7 @@ mod bounded_northbound;
 mod bringup;
 mod capture;
 mod config_apply_v2;
+mod final_audit_regressions;
 mod handshake;
 mod link_faults;
 mod mute;

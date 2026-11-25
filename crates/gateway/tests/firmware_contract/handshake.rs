@@ -151,3 +151,79 @@ async fn hello_reports_configured_tail_and_disabled_aec_honestly() {
         );
     }
 }
+
+/// Real TCP handshake contract for `Hello.auth_token` (used by LAN thin
+/// gateways) and Core's `HelloReject { reason: "unauthorized" }` handling.
+#[tokio::test]
+async fn hello_sends_optional_auth_token_and_handles_unauthorized_reject() {
+    // 1. Configured token travels on the real wire; unauthorized reject paints
+    //    the sticky protocol-error lamp and emits a ProtocolError frame.
+    let probes = Arc::new(Mutex::new(Probes::default()));
+    let (hw, _btn) = FakeHardware::new(probes.clone());
+    let (core, port) = spawn_fake_core().await;
+    spawn_firmware(
+        FirmwareConfig {
+            core_addr: format!("127.0.0.1:{port}"),
+            state_dir: state_dir("hello-auth-reject"),
+            auth_token: Some("hm1_lan_secret_42".into()),
+            loudness: false,
+            boot_health: false,
+            ..Default::default()
+        },
+        Arc::new(hw),
+    );
+    let hello = core.recv().await;
+    match hello {
+        GatewayFrame::Hello { auth_token, .. } => {
+            assert_eq!(auth_token.as_deref(), Some("hm1_lan_secret_42"));
+        }
+        other => panic!("expected Hello with auth_token, got {other:?}"),
+    }
+    core.send(&CoreFrame::HelloReject {
+        protocol: PROTOCOL_VERSION,
+        min_protocol: PROTOCOL_MIN_VERSION,
+        core_version: "test-core".into(),
+        reason: "unauthorized".into(),
+    })
+    .await;
+    let err_frame = core.recv().await;
+    match err_frame {
+        GatewayFrame::ProtocolError { reason, .. } => {
+            assert!(
+                reason.contains("unauthorized"),
+                "expected unauthorized reason, got {reason}"
+            );
+        }
+        other => panic!("expected ProtocolError after HelloReject, got {other:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let painted = probes.lock().unwrap().leds.clone();
+    assert!(
+        painted.iter().any(|f| f[0] == leds::FAULT_PROTOCOL_RGB),
+        "unauthorized reject must paint protocol-error lamp; frames: {:?}",
+        painted.iter().map(|f| f[0]).collect::<Vec<_>>()
+    );
+
+    // 2. Unset token is omitted (None) on the wire.
+    let probes2 = Arc::new(Mutex::new(Probes::default()));
+    let (hw2, _btn2) = FakeHardware::new(probes2);
+    let (core2, port2) = spawn_fake_core().await;
+    spawn_firmware(
+        FirmwareConfig {
+            core_addr: format!("127.0.0.1:{port2}"),
+            state_dir: state_dir("hello-auth-none"),
+            auth_token: None,
+            loudness: false,
+            boot_health: false,
+            ..Default::default()
+        },
+        Arc::new(hw2),
+    );
+    let hello2 = core2.recv().await;
+    match hello2 {
+        GatewayFrame::Hello { auth_token, .. } => {
+            assert_eq!(auth_token, None);
+        }
+        other => panic!("expected Hello without auth_token, got {other:?}"),
+    }
+}

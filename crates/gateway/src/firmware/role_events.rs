@@ -75,10 +75,15 @@ impl Role {
                     }
                     let i = if chan == Chan::Voice { 0 } else { 1 };
                     let stop_task = sh.pending_stop[i].take();
-                    // R1d: a local stop is its own fact. It has no pending
-                    // `Stop` (the core never asked), so the StopReceipt path
-                    // must not be the only reader of this flush.
-                    let local = sh.local_stop.take().filter(|_| chan == Chan::Voice);
+                    // R1d: a local stop is its own fact (Voice only). It has no
+                    // pending `Stop` (the core never asked), so the StopReceipt
+                    // path must not be the only reader of this flush — and a
+                    // Music flush must never consume Voice's `local_stop`.
+                    let local = if chan == Chan::Voice {
+                        sh.local_stop.take()
+                    } else {
+                        None
+                    };
                     let cur = sh.chan_slot(chan).as_ref().map(|(t, _)| t.clone());
                     let outcome = flush_outcome(
                         stop_task.as_deref(),
@@ -150,6 +155,9 @@ impl Role {
                         channels,
                         detail: ex.flush_err.map(|e| format!("flush_failed: {e}")),
                     });
+                    if let Some(kw) = ex.deferred_keyword {
+                        send(kw);
+                    }
                 }
                 match outcome {
                     FlushOutcome::LocallyStopped {
@@ -240,8 +248,9 @@ impl Role {
                 // parking a `pending_stop` nobody will ever answer (R0 debt:
                 // "writei 写失败后到达的 Stop 拿不到回执").
                 let mut owed: Vec<(Chan, String, bool)> = Vec::new();
-                let north = {
+                let (pending_eq_frame, settled_exit, north) = {
                     let mut sh = lock_or_fault(&self.shared, Some(&self.fault), "role.shared");
+                    let mut settled_exit = None;
                     for i in 0..2 {
                         let chan = if i == 0 { Chan::Voice } else { Chan::Music };
                         if sh.stamp(chan) != stamps[i] {
@@ -253,6 +262,17 @@ impl Role {
                         let pending = sh.pending_stop[i].take();
                         let slot = sh.active[i].take();
                         sh.play_live[i] = false;
+                        if let Some(ex) = sh.local_exit.as_mut() {
+                            if ex.pending & (1u8 << i) != 0 {
+                                ex.pending &= !(1u8 << i);
+                                if ex.flush_err.is_none() {
+                                    ex.flush_err = Some(e.clone());
+                                }
+                                if ex.pending == 0 {
+                                    settled_exit = sh.local_exit.take();
+                                }
+                            }
+                        }
                         match (slot, pending) {
                             (Some((task_id, _)), p) => owed.push((chan, task_id, p.is_some())),
                             // A stop whose play already left the slot: still
@@ -261,13 +281,41 @@ impl Role {
                             (None, None) => {}
                         }
                     }
-                    sh.north_tx.clone()
+                    let pending_eq_frame = sh.pending_eq_receipt.take().map(|pending| {
+                        let mut receipt = pending.receipt;
+                        receipt.status = crate::protocol::ConfigReceiptStatus::Failed;
+                        receipt.error_code = Some("playback_unavailable".into());
+                        receipt.retryable = true;
+                        sh.config_journal
+                            .record_terminal(&receipt, Some(pending.persisted_values));
+                        let _ = sh.config_journal.save(&self.cfg.state_dir);
+                        receipt.into_frame()
+                    });
+                    (pending_eq_frame, settled_exit, sh.north_tx.clone())
                 };
                 let send = |frame| {
                     if let Some(tx) = &north {
                         tx.send_ctrl(frame);
                     }
                 };
+                if let Some(ex) = settled_exit {
+                    let latency_ms = now_ms().saturating_sub(ex.fired_ms);
+                    let channels = ex.channels();
+                    send(GatewayFrame::LocalExitFlushed {
+                        device: self.cfg.device_id.clone(),
+                        keyword: ex.keyword,
+                        ts: ex.fired_ms,
+                        latency_ms,
+                        channels,
+                        detail: ex.flush_err.map(|err| format!("flush_failed: {err}")),
+                    });
+                    if let Some(kw) = ex.deferred_keyword {
+                        send(kw);
+                    }
+                }
+                if let Some(eq_frame) = pending_eq_frame {
+                    send(eq_frame);
+                }
                 for (_chan, task_id, stop_owed) in owed {
                     if stop_owed {
                         send(GatewayFrame::StopReceipt {
@@ -301,7 +349,7 @@ impl Role {
                     let Some(pending) = sh.pending_eq_receipt.take() else {
                         return;
                     };
-                    if pending.eq_rev != eq_rev {
+                    if eq_rev < pending.eq_rev {
                         sh.pending_eq_receipt = Some(pending);
                         return;
                     }

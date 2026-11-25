@@ -236,18 +236,17 @@ pub(super) fn playback_thread(
     events: mpsc::UnboundedSender<PlayEvent>,
     shared: Arc<Mutex<Shared>>,
     ref_feed: Option<Arc<aec::dealias::Dealias>>,
-    mix_gain: f32,
     loudness_on: bool,
     loudness_bass: f32,
     loudness_curve: Option<loudness::Curve>,
     loudness_mbcl: Option<bool>,
     eq_bands: Vec<loudness::CustomBand>,
     loopback_probe: bool,
-    mut probe: Option<ProbeSink>,
     progress: Arc<PlayProgress>,
     fault: Arc<AudioFault>,
     playback_alive: Arc<AtomicBool>,
 ) {
+    let mut probe: Option<ProbeSink> = None;
     let _exit_guard = PlaybackExitGuard {
         alive: playback_alive,
         fault: fault.clone(),
@@ -305,12 +304,6 @@ pub(super) fn playback_thread(
     let mut live_prev = [false, false];
 
     loop {
-        // Watchdog truth: "this channel has audio" (a live stream or queued
-        // frames), independent of whether a period is complete yet. The copy
-        // that MATTERS is re-read at the write site below — this one is one
-        // command drain stale (the first Samples of a play land after it).
-        progress.set_live(0, voice.live || !voice.pending.is_empty());
-        progress.set_live(1, music.live || !music.pending.is_empty());
         let quiet =
             !voice.live && !music.live && voice.pending.is_empty() && music.pending.is_empty();
         // B-M3: a live stream holding less than one period is NOT idle — it
@@ -546,7 +539,6 @@ pub(super) fn playback_thread(
             eq_applied = eq_rev;
             let _ = events.send(PlayEvent::EqApplied { eq_rev });
         }
-        let _ = mix_gain;
         let gain = effective_playback_gain(level, live_mix_gain);
         loudness.set_level(level);
         let per = PLAY_PERIOD as usize;
@@ -793,6 +785,7 @@ fn reserve_decoded_play(
         return false;
     }
     if admitted {
+        drop(sh);
         vendor.set_playback_active(true);
         role.hw.set_home_indicator(vendor.indicator_owner());
         return true;

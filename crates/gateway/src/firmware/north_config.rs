@@ -8,6 +8,108 @@ use super::role::PendingEqConfig;
 use super::*;
 use crate::protocol::{ConfigBlock, ConfigReceiptStatus, MAX_CONFIG_FRAME_BYTES};
 
+/// Bounded wait for a restarted `hm-kws` sidecar to emit `ready` after
+/// `ConfigApply(Kws)`. Covers slow cold model loads (~11.8 s measured on LX06
+/// plus up to 1.5 s SIGTERM→SIGKILL grace) while staying strictly below Core's
+/// 25 s KWS apply timeout and guaranteeing Core never hangs indefinitely on a
+/// wedged sidecar.
+pub const KWS_RELOAD_TIMEOUT_MS: u64 = 20_000;
+
+#[derive(Debug, Clone)]
+pub(super) struct PendingKwsConfig {
+    pub(super) target_gen: u64,
+    /// Monotonic timestamp (`kws::mono_ms()`) when this KWS reload was staged.
+    pub(super) staged_ms: u64,
+    pub(super) receipt: ConfigReceiptData,
+    pub(super) persisted_values: serde_json::Value,
+    pub(super) detail: String,
+    pub(super) signalled: bool,
+}
+
+pub(super) fn handle_kws_lifecycle(
+    shared: &Arc<Mutex<Shared>>,
+    state_dir: &std::path::Path,
+    ev: kws::KwsLifecycleEvent,
+) {
+    let (receipt_frame, north) = {
+        let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(pending) = sh.pending_kws_receipt.take() else {
+            return;
+        };
+        match ev {
+            kws::KwsLifecycleEvent::Ready {
+                reload_gen,
+                load_ms,
+                threshold,
+                score,
+                loaded_hash,
+                local_exit,
+            } => {
+                if reload_gen < pending.target_gen {
+                    sh.pending_kws_receipt = Some(pending);
+                    return;
+                }
+                let mut receipt = pending.receipt;
+                sh.config_journal.state_revision =
+                    sh.config_journal.state_revision.saturating_add(1);
+                receipt.state_revision = sh.config_journal.state_revision;
+                receipt.status = ConfigReceiptStatus::Active;
+                receipt.active_hash = Some(receipt.block_hash.clone());
+                receipt.active_values = Some(pending.persisted_values.clone());
+                receipt.evidence = Some(serde_json::json!({
+                    "restarted": pending.signalled,
+                    "reloaded": true,
+                    "reload_gen": reload_gen,
+                    "load_ms": load_ms,
+                    "loaded_hash": loaded_hash,
+                    "loaded_threshold": threshold,
+                    "loaded_score": score,
+                    "local_exit": local_exit,
+                    "detail": pending.detail,
+                }));
+                sh.config_journal
+                    .record_terminal(&receipt, Some(pending.persisted_values));
+                let _ = sh.config_journal.save(state_dir);
+                fwlog!(
+                    "[config_v2] kws active after sidecar reload (reload_gen={reload_gen}, load_ms={load_ms})"
+                );
+                (receipt.into_frame(), sh.north_tx.clone())
+            }
+            kws::KwsLifecycleEvent::Failed {
+                reload_gen,
+                error_code,
+                detail,
+            } => {
+                if reload_gen < pending.target_gen {
+                    sh.pending_kws_receipt = Some(pending);
+                    return;
+                }
+                let mut receipt = pending.receipt;
+                receipt.status = ConfigReceiptStatus::Failed;
+                receipt.active_hash = None;
+                receipt.active_values = None;
+                receipt.error_code = Some(error_code.into());
+                receipt.retryable = true;
+                receipt.evidence = Some(serde_json::json!({
+                    "restarted": pending.signalled,
+                    "reload_gen": reload_gen,
+                    "detail": detail,
+                }));
+                sh.config_journal
+                    .record_terminal(&receipt, Some(pending.persisted_values));
+                let _ = sh.config_journal.save(state_dir);
+                fwlog!(
+                    "[config_v2] kws reload failed (reload_gen={reload_gen}, error_code={error_code}): {detail}"
+                );
+                (receipt.into_frame(), sh.north_tx.clone())
+            }
+        }
+    };
+    if let Some(tx) = north {
+        tx.send_ctrl(receipt_frame);
+    }
+}
+
 impl Role {
     pub(super) fn stage_kws_bundle_meta(
         &self,
@@ -53,7 +155,7 @@ impl Role {
         if device != self.cfg.device_id {
             return;
         }
-        let desc = self.descriptor();
+        let capabilities = self.capabilities();
         let kws_dir = {
             let sh = lock_or_fault(&self.shared, Some(&self.fault), "config_state.shared");
             if sh.negotiated_protocol < 2 || !sh.config_apply_v2 {
@@ -69,7 +171,11 @@ impl Role {
                 .map(|c| c.dir.clone())
                 .unwrap_or_else(|| self.cfg.kws_dir.clone())
         };
-        let (model_hash, token_hash) = kws_model_token_hashes(&kws_dir);
+        let (model_hash, token_hash) = if self.cfg.kws {
+            kws_model_token_hashes(&kws_dir)
+        } else {
+            (None, None)
+        };
         let (boot_id, state_rev, blocks, tz_offset, tz_name) = {
             let sh = lock_or_fault(&self.shared, Some(&self.fault), "config_state.shared");
             (
@@ -80,25 +186,29 @@ impl Role {
                 sh.led_timezone.clone(),
             )
         };
+        let mut block_schemas = serde_json::json!({
+            "audio_eq": 1,
+            "led": 1,
+            "duplex": 1,
+            "acoustics": 1,
+        });
+        let mut bounds = serde_json::json!({
+            "audio_eq": { "max_bands": 10, "freq_hz": [20.0, 16000.0], "gain_db": [-18.0, 18.0], "q": [0.3, 8.0] },
+            "led": { "minute": [0, 1439], "brightness_pct": [0, 100], "rotation": [0, 11], "tz_offset_minutes": [-720, 840] },
+            "acoustics": { "volume_cap": [0.0, 1.0], "mix_gain": [0.05, 2.0], "onset_threshold_dbfs": [-120.0, 0.0], "mic_gain_offset_db": [-24.0, 24.0] },
+        });
+        if self.cfg.kws {
+            block_schemas["kws"] = serde_json::json!(1);
+            bounds["kws"] = serde_json::json!({ "threshold": [0.0, 1.0], "score": [0.0, 20.0] });
+        }
         let _ = direct_tx.send_ctrl(GatewayFrame::ConfigState {
             request_id,
             device,
             gateway_boot_id: boot_id,
             state_revision: state_rev,
-            capabilities: desc.capabilities,
-            block_schemas: serde_json::json!({
-                "kws": 1,
-                "audio_eq": 1,
-                "led": 1,
-                "duplex": 1,
-                "acoustics": 1,
-            }),
-            bounds: serde_json::json!({
-                "audio_eq": { "max_bands": 10, "freq_hz": [20.0, 16000.0], "gain_db": [-18.0, 18.0], "q": [0.3, 8.0] },
-                "led": { "minute": [0, 1439], "brightness_pct": [0, 100], "rotation": [0, 11], "tz_offset_minutes": [-720, 840] },
-                "acoustics": { "volume_cap": [0.0, 1.0], "mix_gain": [0.05, 2.0], "onset_threshold_dbfs": [-120.0, 0.0], "mic_gain_offset_db": [-24.0, 24.0] },
-                "kws": { "threshold": [0.0, 1.0], "score": [0.0, 20.0] },
-            }),
+            capabilities,
+            block_schemas,
+            bounds,
             model_id: Some(self.cfg.model.clone()),
             model_hash,
             token_hash,
@@ -124,8 +234,7 @@ impl Role {
         values: serde_json::Value,
         direct_tx: &NorthTx,
     ) {
-        let desc = self.descriptor();
-        let cap_fp = capability_fingerprint(&desc.capabilities);
+        let cap_fp = capability_fingerprint(&self.capabilities());
         let (boot_id, state_rev, kws_dir, v2_negotiated) = {
             let sh = lock_or_fault(&self.shared, Some(&self.fault), "config_validate.shared");
             let dir = sh
@@ -140,7 +249,11 @@ impl Role {
                 sh.negotiated_protocol >= 2 && sh.config_apply_v2,
             )
         };
-        let (model_hash, token_hash) = kws_model_token_hashes(&kws_dir);
+        let (model_hash, token_hash) = if self.cfg.kws {
+            kws_model_token_hashes(&kws_dir)
+        } else {
+            (None, None)
+        };
         let mut blockers = Vec::new();
         if !v2_negotiated {
             blockers.push("config_apply_v2_not_negotiated".into());
@@ -172,13 +285,20 @@ impl Role {
 
         let normalized_values = if blockers.is_empty() {
             match block {
-                ConfigBlock::Kws => match config_journal::validate_kws(&values, &kws_dir) {
-                    Ok(v) => Some(v.normalized),
-                    Err(e) => {
-                        blockers.extend(e);
+                ConfigBlock::Kws => {
+                    if !self.cfg.kws {
+                        blockers.push("kws_disabled".into());
                         None
+                    } else {
+                        match config_journal::validate_kws(&values, &kws_dir) {
+                            Ok(v) => Some(v.normalized),
+                            Err(e) => {
+                                blockers.extend(e);
+                                None
+                            }
+                        }
                     }
-                },
+                }
                 ConfigBlock::AudioEq => match config_journal::validate_audio_eq(&values) {
                     Ok(v) => Some(v.normalized),
                     Err(e) => {
@@ -252,8 +372,7 @@ impl Role {
         values: serde_json::Value,
         direct_tx: &NorthTx,
     ) {
-        let desc = self.descriptor();
-        let cap_fp = capability_fingerprint(&desc.capabilities);
+        let cap_fp = capability_fingerprint(&self.capabilities());
 
         let make_receipt = |boot_id: String,
                             state_rev: u64,
@@ -393,6 +512,49 @@ impl Role {
                 OpLookup::New => {}
             }
 
+            if let Some(pending) = sh.pending_kws_receipt.as_ref() {
+                if pending.receipt.operation_id == operation_id {
+                    if pending.receipt.block == block && pending.receipt.block_hash == block_hash {
+                        return;
+                    }
+                    let r = make_receipt(
+                        boot_id,
+                        state_rev,
+                        ConfigReceiptStatus::Failed,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some("operation_conflict".into()),
+                        false,
+                    );
+                    drop(sh);
+                    let _ = direct_tx.send_ctrl(r.into_frame());
+                    return;
+                }
+            }
+            if let Some(pending) = sh.pending_eq_receipt.as_ref() {
+                if pending.receipt.operation_id == operation_id {
+                    if pending.receipt.block == block && pending.receipt.block_hash == block_hash {
+                        return;
+                    }
+                    let r = make_receipt(
+                        boot_id,
+                        state_rev,
+                        ConfigReceiptStatus::Failed,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some("operation_conflict".into()),
+                        false,
+                    );
+                    drop(sh);
+                    let _ = direct_tx.send_ctrl(r.into_frame());
+                    return;
+                }
+            }
+
             if let Err(reason) =
                 sh.config_journal
                     .check_high_water(block, data_epoch, block_generation)
@@ -483,6 +645,21 @@ impl Role {
         // 4. Block-specific validation, persistence, and execution.
         match block {
             ConfigBlock::Kws => {
+                if !self.cfg.kws {
+                    let r = make_receipt(
+                        boot_id,
+                        state_rev,
+                        ConfigReceiptStatus::Unsupported,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some("kws_disabled".into()),
+                        false,
+                    );
+                    let _ = direct_tx.send_ctrl(r.into_frame());
+                    return;
+                }
                 let v = match config_journal::validate_kws(&values, &kws_dir) {
                     Ok(v) => v,
                     Err(errs) => {
@@ -576,7 +753,6 @@ impl Role {
                         st.local_exit = local_exit;
                     }
                 }
-                let restarted = control.as_ref().map(|c| c.restart()).unwrap_or(false);
                 let active_vals = serde_json::json!({
                     "keywords_hash": kw_hash,
                     "intents_hash": v.intents_hash,
@@ -587,21 +763,89 @@ impl Role {
                     "bundle_id": bundle_id,
                     "kws_generation": bundle_gen,
                 });
-                let r = make_receipt(
-                    boot_id,
-                    state_rev.saturating_add(1),
-                    ConfigReceiptStatus::Active,
-                    Some(block_hash.clone()),
-                    Some(block_hash.clone()),
-                    Some(active_vals.clone()),
-                    Some(serde_json::json!({
-                        "restarted": restarted,
-                        "detail": detail,
-                    })),
-                    None,
-                    false,
+                let Some(ctrl) = control else {
+                    let r = make_receipt(
+                        boot_id,
+                        state_rev,
+                        ConfigReceiptStatus::Failed,
+                        Some(block_hash.clone()),
+                        None,
+                        None,
+                        Some(serde_json::json!({
+                            "detail": "kws supervisor control unavailable",
+                        })),
+                        Some("kws_sidecar_unavailable".into()),
+                        true,
+                    );
+                    self.record_and_send_receipt(r, Some(active_vals), direct_tx);
+                    return;
+                };
+                if !kws::script_ready(&kws_dir.join("run.sh")) {
+                    let r = make_receipt(
+                        boot_id,
+                        state_rev,
+                        ConfigReceiptStatus::Failed,
+                        Some(block_hash.clone()),
+                        None,
+                        None,
+                        Some(serde_json::json!({
+                            "detail": format!("keyword sidecar not installed: {}", kws_dir.join("run.sh").display()),
+                        })),
+                        Some("kws_sidecar_unavailable".into()),
+                        true,
+                    );
+                    self.record_and_send_receipt(r, Some(active_vals), direct_tx);
+                    return;
+                }
+                // Defer `Active` until the restarted `hm-kws` sidecar actually
+                // emits `ready` (or emit `Failed` on spawn/error/exit/timeout).
+                // Hold `sh` across `request_reload()` so `pending_kws_receipt`
+                // is guaranteed visible before `handle_kws_lifecycle` can run.
+                let (target_gen, superseded_frame) = {
+                    let mut sh = lock_or_fault(&self.shared, Some(&self.fault), "config_apply.kws");
+                    let (target_gen, signalled) = ctrl.request_reload();
+                    let pending_receipt = make_receipt(
+                        boot_id,
+                        state_rev,
+                        ConfigReceiptStatus::Persisted,
+                        Some(block_hash.clone()),
+                        None,
+                        None,
+                        None,
+                        None,
+                        false,
+                    );
+                    let replaced = sh.pending_kws_receipt.replace(PendingKwsConfig {
+                        target_gen,
+                        staged_ms: kws::mono_ms(),
+                        receipt: pending_receipt,
+                        persisted_values: active_vals.clone(),
+                        detail: detail.clone(),
+                        signalled,
+                    });
+                    let superseded_frame = replaced.map(|old| {
+                        let mut r = old.receipt;
+                        r.status = ConfigReceiptStatus::Superseded;
+                        r.active_hash = None;
+                        r.active_values = None;
+                        r.error_code = Some("superseded_by_newer_kws".into());
+                        r.evidence = Some(serde_json::json!({
+                            "superseded_by_reload_gen": target_gen,
+                            "superseded_by_operation_id": operation_id,
+                        }));
+                        r.retryable = false;
+                        sh.config_journal.record_terminal(&r, None);
+                        let _ = sh.config_journal.save(&self.cfg.state_dir);
+                        r.into_frame()
+                    });
+                    (target_gen, superseded_frame)
+                };
+                if let Some(frame) = superseded_frame {
+                    let _ = direct_tx.send_ctrl(frame);
+                }
+                fwlog!(
+                    "[config_v2] kws staged; awaiting sidecar ready (reload_gen={target_gen}, detail={detail})"
                 );
-                self.record_and_send_receipt(r, Some(active_vals), direct_tx);
             }
             ConfigBlock::AudioEq => {
                 let v = match config_journal::validate_audio_eq(&values) {
@@ -641,10 +885,8 @@ impl Role {
                     self.record_and_send_receipt(r, None, direct_tx);
                     return;
                 }
-                let playback_alive = {
-                    let sh = lock_or_fault(&self.shared, Some(&self.fault), "config_apply.eq");
-                    sh.play_tx.is_some() && !self.fault.is_requested()
-                };
+                let playback_alive =
+                    self.playback_alive.load(Ordering::Acquire) && !self.fault.is_requested();
                 if !playback_alive {
                     let r = make_receipt(
                         boot_id,
@@ -663,7 +905,10 @@ impl Role {
 
                 // Stage EQ in Shared and defer the `Active` receipt until
                 // `playback.rs` rebuilds `Loudness` at the 42 ms period boundary.
-                let new_eq_rev = {
+                // If an earlier `ConfigApply(AudioEq)` is still awaiting its
+                // period boundary, settle it as `Superseded` rather than
+                // dropping its receipt.
+                let (new_eq_rev, superseded_frame) = {
                     let mut sh = lock_or_fault(&self.shared, Some(&self.fault), "config_apply.eq");
                     sh.eq_curve = Some(v.curve);
                     sh.eq_bands = v.bands.clone();
@@ -680,13 +925,31 @@ impl Role {
                         None,
                         false,
                     );
-                    sh.pending_eq_receipt = Some(PendingEqConfig {
+                    let replaced = sh.pending_eq_receipt.replace(PendingEqConfig {
                         eq_rev: rev,
                         receipt: pending_receipt,
                         persisted_values: v.normalized.clone(),
                     });
-                    rev
+                    let superseded_frame = replaced.map(|old| {
+                        let mut r = old.receipt;
+                        r.status = ConfigReceiptStatus::Superseded;
+                        r.active_hash = None;
+                        r.active_values = None;
+                        r.error_code = Some("superseded_by_newer_audio_eq".into());
+                        r.evidence = Some(serde_json::json!({
+                            "superseded_by_eq_rev": rev,
+                            "superseded_by_operation_id": operation_id,
+                        }));
+                        r.retryable = false;
+                        sh.config_journal.record_terminal(&r, None);
+                        let _ = sh.config_journal.save(&self.cfg.state_dir);
+                        r.into_frame()
+                    });
+                    (rev, superseded_frame)
                 };
+                if let Some(frame) = superseded_frame {
+                    let _ = direct_tx.send_ctrl(frame);
+                }
                 fwlog!(
                     "[loudness] audio_eq staged for 42ms period rebuild (eq_rev={new_eq_rev}, curve={:?}, bands={})",
                     v.curve,
@@ -807,6 +1070,8 @@ impl Role {
                     false,
                 );
                 self.record_and_send_receipt(r, Some(active_vals), direct_tx);
+                let _ =
+                    direct_tx.send_ctrl(self.mode_report_frame(v.duplex_requested, "half".into()));
             }
             ConfigBlock::Acoustics => {
                 let v = match config_journal::validate_acoustics(&values) {
@@ -854,7 +1119,9 @@ impl Role {
                     sh.volume_cap = v.volume_cap;
                     sh.mix_gain = v.mix_gain;
                     sh.vad_threshold = v.onset_threshold_dbfs;
-                    sh.mic_gain_offset_db = v.mic_gain_offset_db;
+                    // `mic_gain_offset_db` is persisted in `acoustics_config.json`
+                    // and echoed in `active_values` for Core wake-arbitration
+                    // calibration; gateway wire RMS intentionally stays raw.
                     sh.barge.clone()
                 };
                 if let Some(barge) = barge_arc {
@@ -877,6 +1144,53 @@ impl Role {
                 );
                 self.record_and_send_receipt(r, Some(v.normalized), direct_tx);
             }
+        }
+    }
+
+    pub(super) fn watch_pending_kws_receipt(&self) {
+        self.watch_pending_kws_receipt_at(kws::mono_ms());
+    }
+
+    pub(super) fn watch_pending_kws_receipt_at(&self, now_mono_ms: u64) {
+        let timeout_ms = if self.cfg.kws_reload_timeout_ms == 0 {
+            KWS_RELOAD_TIMEOUT_MS
+        } else {
+            self.cfg.kws_reload_timeout_ms
+        };
+        let (frame, north) = {
+            let mut sh = lock_or_fault(&self.shared, Some(&self.fault), "config_kws.watch");
+            let expired = sh
+                .pending_kws_receipt
+                .as_ref()
+                .is_some_and(|p| now_mono_ms.saturating_sub(p.staged_ms) >= timeout_ms);
+            if !expired {
+                return;
+            }
+            let Some(pending) = sh.pending_kws_receipt.take() else {
+                return;
+            };
+            let mut receipt = pending.receipt;
+            receipt.status = ConfigReceiptStatus::Failed;
+            receipt.active_hash = None;
+            receipt.active_values = None;
+            receipt.error_code = Some("kws_reload_timeout".into());
+            receipt.retryable = true;
+            receipt.evidence = Some(serde_json::json!({
+                "restarted": pending.signalled,
+                "reload_gen": pending.target_gen,
+                "timeout_ms": timeout_ms,
+            }));
+            sh.config_journal
+                .record_terminal(&receipt, Some(pending.persisted_values));
+            let _ = sh.config_journal.save(&self.cfg.state_dir);
+            fwlog!(
+                "[config_v2] kws reload timed out after {timeout_ms}ms (reload_gen={})",
+                pending.target_gen
+            );
+            (receipt.into_frame(), sh.north_tx.clone())
+        };
+        if let Some(tx) = north {
+            tx.send_ctrl(frame);
         }
     }
 

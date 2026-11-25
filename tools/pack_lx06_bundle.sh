@@ -1,23 +1,156 @@
 #!/usr/bin/env bash
 # Build and pack the Scheme A compressed runtime bundles for Xiaomi AI Speaker Pro (LX06).
 #
-# Scheme A storage topology:
-#   - /data/hm/hm-bundle.tar.xz (<= 6.0 MiB):
-#       - hm-core (aarch64-unknown-linux-musl, --slim / --no-default-features)
-#       - hm-gateway (aarch64-unknown-linux-musl, static musl + rust-lld)
-#       - silero_vad.onnx (pinned SHA-256: 9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6)
-#       - web/ (compiled console assets from hm-core web/dist)
-#   - /data/hm/hm-bundle.sha256
-#   - /data/hm/unxz (static aarch64 xz decompressor)
-#   - /data/hm/kws.sha256 + hm-kws-lx06.tar.xz (unpacked to /tmp/hm-kws via kws.url)
-#       - hm-kws (aarch64 glibc sidecar with #63/#65/#66 Silero VAD fixes)
-#       - deploy/lx06/kws-run.sh -> run.sh (--vad-model /tmp/hm/silero_vad.onnx --vad-gain 3.0)
-#       - Sherpa-ONNX KWS model + runtime shared libraries
+# Modes:
+#   Default (256 MB RAM LX06, full on-device runtime):
+#     - /data/hm/hm-bundle.tar.xz (<= 6.0 MiB):
+#         - hm-core (aarch64-unknown-linux-musl, --slim / --no-default-features)
+#         - hm-gateway (aarch64-unknown-linux-musl, static musl + rust-lld)
+#         - silero_vad.onnx (pinned SHA-256: 9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6)
+#         - web/ (compiled console assets from hm-core web/dist)
+#     - /data/hm/hm-bundle.sha256
+#     - /data/hm/unxz (static aarch64 xz decompressor)
+#     - /data/hm/kws.sha256 + hm-kws-lx06.tar.xz (unpacked to /tmp/hm-kws via kws.url)
+#         - hm-kws (aarch64 glibc sidecar with #63/#65/#66 Silero VAD fixes)
+#         - deploy/lx06/kws-run.sh -> run.sh (--vad-model /tmp/hm/silero_vad.onnx --vad-gain 3.0)
+#         - Sherpa-ONNX KWS model + runtime shared libraries
+#
+#   --thin (128 MB RAM LX06 Thin Gateway, pairs with LAN Full Docker hm-core):
+#     - hm-lx06-thin.tar.xz (<= 1.5 MiB) + hm-lx06-thin.sha256:
+#         - hm-gateway ONLY (no hm-core, no web/, no silero_vad.onnx, no hm-kws)
+#     - Avoids unpacking 12.6 MiB hm-core into 59 MiB /tmp tmpfs completely.
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")/.." && pwd)
-CORE_REPO="${CORE_REPO:-$(cd "$HERE/../home mate b" && pwd)}"
 OUT_DIR="${OUT_DIR:-$HERE/build/lx06}"
+PINNED_VAD_SHA256="9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
+MAX_MAIN_BUNDLE_BYTES=$((6 * 1024 * 1024))  # 6.0 MiB hard gate for 13.3 MiB /data UBIFS
+MAX_THIN_BUNDLE_BYTES=$((1536 * 1024))      # 1.5 MiB hard gate for 128 MB thin gateway bundle
+
+SKIP_BUILD=0
+SKIP_WEB_BUILD=0
+THIN_MODE=0
+for arg in "$@"; do
+    case "$arg" in
+        --skip-build) SKIP_BUILD=1 ;;
+        --skip-web-build) SKIP_WEB_BUILD=1 ;;
+        --thin) THIN_MODE=1 ;;
+        -h|--help)
+            echo "Usage: $0 [--thin] [--skip-build] [--skip-web-build]"
+            exit 0
+            ;;
+        *)
+            echo "pack_lx06_bundle: unknown option '$arg' (supported: --thin, --skip-build, --skip-web-build)" >&2
+            exit 2
+            ;;
+    esac
+done
+
+GW_BIN="$HERE/target/aarch64-unknown-linux-musl/release/home-mate-device-gateway"
+
+copy_unxz_if_available() {
+    if [[ -n "${UNXZ_BIN:-}" ]]; then
+        if [[ ! -s "$UNXZ_BIN" ]]; then
+            echo "pack_lx06_bundle: UNXZ_BIN is missing or empty: $UNXZ_BIN" >&2
+            exit 1
+        fi
+        if [[ "$UNXZ_BIN" != "$OUT_DIR/unxz" ]]; then
+            cp "$UNXZ_BIN" "$OUT_DIR/unxz"
+        fi
+        chmod 0755 "$OUT_DIR/unxz"
+        echo "PASS  unxz (aarch64)     : $UNXZ_BIN"
+        return 0
+    fi
+    for cand in \
+        "$OUT_DIR/unxz" \
+        "$HERE/out/lx06/unxz" \
+        "/private/tmp/lx06-bundle/unxz"; do
+        if [[ -s "$cand" ]]; then
+            if [[ "$cand" != "$OUT_DIR/unxz" ]]; then
+                cp "$cand" "$OUT_DIR/unxz"
+            fi
+            chmod 0755 "$OUT_DIR/unxz"
+            echo "PASS  unxz (aarch64)     : $cand"
+            return 0
+        fi
+    done
+    echo "WARN  static aarch64 unxz not bundled (set UNXZ_BIN=/path/to/unxz to bundle; install-lx06.sh will fall back to speaker unxz)" >&2
+}
+
+if [[ "$THIN_MODE" -eq 1 ]]; then
+    if [[ "$SKIP_BUILD" -eq 0 ]]; then
+        echo "=== [1/2] Building LX06 hm-gateway (aarch64-unknown-linux-musl, thin mode) ==="
+        (cd "$HERE" && ./tools/build_firmware_lx06.sh)
+    fi
+
+    if [[ ! -s "$GW_BIN" ]]; then
+        echo "pack_lx06_bundle: required input missing or empty: $GW_BIN" >&2
+        exit 1
+    fi
+
+    mkdir -p "$OUT_DIR"
+
+    echo "=== [2/2] Packing 128 MB thin gateway bundle: $OUT_DIR/hm-lx06-thin.tar.xz ==="
+    python3 - "$GW_BIN" "$OUT_DIR" "$MAX_THIN_BUNDLE_BYTES" <<'PY'
+import hashlib
+import io
+from pathlib import Path
+import subprocess
+import sys
+import tarfile
+
+gw_bin = Path(sys.argv[1])
+out_dir = Path(sys.argv[2])
+max_bytes = int(sys.argv[3])
+
+gw_bytes = gw_bin.read_bytes()
+bundle_path = out_dir / "hm-lx06-thin.tar.xz"
+stage_path = out_dir / "hm-lx06-thin.tar.xz.part"
+
+raw_tar = io.BytesIO()
+with tarfile.open(fileobj=raw_tar, mode="w", format=tarfile.PAX_FORMAT) as tf:
+    info = tarfile.TarInfo("hm-gateway")
+    info.uid = 0
+    info.gid = 0
+    info.uname = "root"
+    info.gname = "root"
+    info.mtime = 1700000000
+    info.type = tarfile.REGTYPE
+    info.mode = 0o755
+    info.size = len(gw_bytes)
+    tf.addfile(info, io.BytesIO(gw_bytes))
+
+compressed = subprocess.run(
+    ["xz", "--arm64", "--lzma2=preset=9e,dict=8MiB", "--check=crc64", "-c"],
+    input=raw_tar.getvalue(),
+    capture_output=True,
+    check=True,
+).stdout
+stage_path.write_bytes(compressed)
+stage_path.replace(bundle_path)
+
+bundle_size = bundle_path.stat().st_size
+bundle_sha = hashlib.sha256(compressed).hexdigest()
+(out_dir / "hm-lx06-thin.sha256").write_text(f"{bundle_sha}\n")
+
+if bundle_size > max_bytes:
+    sys.exit(f"FAIL: hm-lx06-thin.tar.xz is {bundle_size} bytes (> {max_bytes} byte 1.5 MiB cap)")
+
+print(f"PASS  hm-gateway (lx06)  : {len(gw_bytes):>10,} B  sha256={hashlib.sha256(gw_bytes).hexdigest()}")
+print(f"PASS  hm-lx06-thin.tar.xz: {bundle_size:>10,} B ({bundle_size * 100.0 / max_bytes:.1f}% of 1.5 MiB thin gate)")
+print(f"PASS  hm-lx06-thin.sha256: {bundle_sha}")
+PY
+
+    copy_unxz_if_available
+    cp "$HERE/deploy/lx06/init.sh" "$OUT_DIR/init.sh"
+    chmod 0755 "$OUT_DIR/init.sh"
+
+    echo "=== LX06 128 MB thin gateway artifacts ready in $OUT_DIR ==="
+    ls -lh "$OUT_DIR"
+    exit 0
+fi
+
+CORE_REPO="${CORE_REPO:-$(cd "$HERE/../home mate b" && pwd)}"
 if [[ -z "${VAD_MODEL:-}" ]]; then
     for cand in \
         "$CORE_REPO/models/silero_vad.onnx" \
@@ -30,26 +163,44 @@ if [[ -z "${VAD_MODEL:-}" ]]; then
     done
 fi
 VAD_MODEL="${VAD_MODEL:-$CORE_REPO/models/silero_vad.onnx}"
-PINNED_VAD_SHA256="9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6"
-MAX_MAIN_BUNDLE_BYTES=$((6 * 1024 * 1024)) # 6.0 MiB hard gate for 13.3 MiB /data UBIFS
 
-SKIP_BUILD=0
-for arg in "$@"; do
-    case "$arg" in
-        --skip-build) SKIP_BUILD=1 ;;
-        *)
-            echo "pack_lx06_bundle: unknown option '$arg' (supported: --skip-build)" >&2
-            exit 2
-            ;;
-    esac
-done
+web_dist_needs_rebuild() {
+    python3 - "$CORE_REPO/web" <<'PY'
+from pathlib import Path
+import sys
+
+web = Path(sys.argv[1])
+dist_index = web / "dist" / "index.html"
+if not dist_index.is_file() or dist_index.stat().st_size == 0:
+    sys.exit(0)
+dist_mtime = dist_index.stat().st_mtime_ns
+watch_files = [
+    web / "package.json",
+    web / "package-lock.json",
+    web / "index.html",
+    web / "vite.config.ts",
+    web / "vite.config.js",
+    web / "tsconfig.json",
+]
+for f in watch_files:
+    if f.is_file() and f.stat().st_mtime_ns > dist_mtime:
+        sys.exit(0)
+for sub in ("src", "public"):
+    root = web / sub
+    if root.is_dir():
+        for p in root.rglob("*"):
+            if p.is_file() and p.stat().st_mtime_ns > dist_mtime:
+                sys.exit(0)
+sys.exit(1)
+PY
+}
 
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
     echo "=== [1/4] Building slim hm-core (--no-default-features, aarch64-unknown-linux-musl) ==="
     (cd "$CORE_REPO" && ./tools/build_core.sh --slim)
-    if [[ ! -f "$CORE_REPO/web/dist/index.html" ]]; then
-        echo "=== [1b/4] Building web console (npm run build) ==="
-        (cd "$CORE_REPO/web" && npm run build)
+    if [[ "$SKIP_WEB_BUILD" -eq 0 ]] && web_dist_needs_rebuild; then
+        echo "=== [1b/4] Building web console (clean dist + npm run build) ==="
+        (cd "$CORE_REPO/web" && rm -rf dist && npm run build)
     fi
 
     echo "=== [2/4] Building LX06 hm-gateway (aarch64-unknown-linux-musl) ==="
@@ -62,7 +213,6 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
 fi
 
 CORE_BIN="$CORE_REPO/target/aarch64-unknown-linux-musl/release/hm-core"
-GW_BIN="$HERE/target/aarch64-unknown-linux-musl/release/home-mate-device-gateway"
 WEB_DIST="$CORE_REPO/web/dist"
 KWS_BIN="$HERE/kws/hm-kws"
 KWS_RUN="$HERE/deploy/lx06/kws-run.sh"
@@ -172,10 +322,7 @@ print(f"PASS  hm-bundle.sha256 : {bundle_sha}")
 PY
 
 # Copy static aarch64 unxz and init.sh if available
-if [[ -s /private/tmp/lx06-bundle/unxz ]]; then
-    cp /private/tmp/lx06-bundle/unxz "$OUT_DIR/unxz"
-    chmod 0755 "$OUT_DIR/unxz"
-fi
+copy_unxz_if_available
 cp "$HERE/deploy/lx06/init.sh" "$OUT_DIR/init.sh"
 chmod 0755 "$OUT_DIR/init.sh"
 

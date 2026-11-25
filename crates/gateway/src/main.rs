@@ -346,6 +346,16 @@ fn run_firmware(mut args: impl Iterator<Item = String>) {
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--core" => cfg.core_addr = args.next().expect("--core needs host:port"),
+            "--allow-lan-core" => cfg.allow_lan_core = true,
+            "--auth-token" => {
+                let tok = args.next().expect("--auth-token needs a token");
+                let trimmed = tok.trim();
+                cfg.auth_token = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+            }
             "--device-id" => {
                 explicit_device_id = Some(args.next().expect("--device-id needs an id"));
             }
@@ -737,11 +747,18 @@ fn run_firmware(mut args: impl Iterator<Item = String>) {
         eprintln!("--volume-cap must be within 0..1 (got {})", cfg.volume_cap);
         std::process::exit(2);
     }
-    if !home_mate_device_gateway::firmware::core_addr_is_loopback(&cfg.core_addr) {
-        eprintln!(
-            "refusing --core {} — the firmware only dials a core on this speaker (127.0.0.1, ::1, or localhost)",
-            cfg.core_addr
-        );
+    if !home_mate_device_gateway::firmware::core_addr_allowed(&cfg.core_addr, cfg.allow_lan_core) {
+        if cfg.allow_lan_core {
+            eprintln!(
+                "refusing --core {} — even with --allow-lan-core, only loopback or private LAN/Tailscale/ULA IP:port addresses are permitted",
+                cfg.core_addr
+            );
+        } else {
+            eprintln!(
+                "refusing --core {} — the firmware only dials a core on this speaker (127.0.0.1, ::1, or localhost) by default; pass --allow-lan-core for a private LAN/Tailscale/ULA core",
+                cfg.core_addr
+            );
+        }
         std::process::exit(2);
     }
     if !std::path::Path::new(&cfg.led_frame_path).exists() {

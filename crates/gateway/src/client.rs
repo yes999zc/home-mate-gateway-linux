@@ -25,10 +25,14 @@ pub struct GatewayConfig {
 
 impl Default for GatewayConfig {
     fn default() -> Self {
-        let auth_token = std::env::var("HM_GATEWAY_AUTH_TOKEN")
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+        let auth_token = ["HM_CORE_AUTH_TOKEN", "HM_GATEWAY_AUTH_TOKEN"]
+            .into_iter()
+            .find_map(|key| {
+                std::env::var(key)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
         Self {
             core_addr: "127.0.0.1:8932".into(),
             gateway_name: format!("home-mate-device-gateway {}", env!("CARGO_PKG_VERSION")),

@@ -389,12 +389,8 @@ impl StreamResampler {
             // the whole-buffer reference). Before finish we may only emit
             // when the highest NEEDED unclamped index is within the pushed
             // input — end-clamping belongs to finish alone.
-            let needed = if i0 + 2 > last { last } else { i0 + 2 };
-            if needed > last && !finishing {
-                break; // would clamp at the end — wait for more input
-            }
             if !finishing && (i0 + 2) > last {
-                break;
+                break; // would clamp at the end — wait for more input
             }
             // All window indices must sit inside the carry (drop consumed
             // front only when safe: keep from the lowest index any future

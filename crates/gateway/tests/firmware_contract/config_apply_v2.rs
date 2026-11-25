@@ -818,3 +818,204 @@ async fn acoustics_mix_gain_scales_dac_pcm_and_failed_apply_preserves_prior() {
         "restored mix_gain=1.0 must restore DAC amplitude (restored={peak_restored}, peak_0_25={peak_0_25})"
     );
 }
+
+#[tokio::test]
+async fn kws_capabilities_and_config_apply_are_gated_on_cfg_kws() {
+    // 1. Thin / KWS-disabled gateway (cfg.kws == false): must NOT advertise KWS
+    //    capabilities or schema/bounds, and must answer ConfigValidate/ConfigApply(Kws)
+    //    cleanly as unsupported rather than failing on a missing tokens.txt.
+    let probes = Arc::new(Mutex::new(Probes::default()));
+    let (hw, _btn) = FakeHardware::new(probes);
+    let sd = state_dir("cfgv2-kws-off");
+    let (core, port) = spawn_fake_core().await;
+    spawn_firmware(
+        FirmwareConfig {
+            core_addr: format!("127.0.0.1:{port}"),
+            state_dir: sd,
+            kws: false,
+            ..Default::default()
+        },
+        Arc::new(hw),
+    );
+    let hello = core.recv().await;
+    let GatewayFrame::Hello { devices, .. } = hello else {
+        panic!("expected Hello, got {hello:?}");
+    };
+    for forbidden in [
+        "local_exit",
+        "interrupt_wake_word",
+        "interrupt_retreat_local_exit",
+        "config_block_kws",
+    ] {
+        assert!(
+            !devices[0].capabilities.iter().any(|c| c == forbidden),
+            "cfg.kws=false must not advertise {forbidden}: {:?}",
+            devices[0].capabilities
+        );
+    }
+    core.send(&CoreFrame::HelloAck {
+        protocol: 2,
+        min_protocol: 0,
+        supported_versions: vec![0, 2],
+        capabilities: vec!["config_apply_v2".into()],
+        core_version: "test-v2".into(),
+        generation: 1,
+    })
+    .await;
+
+    core.send(&CoreFrame::ConfigStateGet {
+        request_id: "req-kws-off-state".into(),
+        device: "dot2-d".into(),
+    })
+    .await;
+    let state = core
+        .until(|f| matches!(f, GatewayFrame::ConfigState { request_id, .. } if request_id == "req-kws-off-state"))
+        .await;
+    let GatewayFrame::ConfigState {
+        block_schemas,
+        bounds,
+        model_hash,
+        token_hash,
+        ..
+    } = state
+    else {
+        unreachable!();
+    };
+    assert!(block_schemas.get("kws").is_none());
+    assert!(bounds.get("kws").is_none());
+    assert_eq!(model_hash, None);
+    assert_eq!(token_hash, None);
+
+    core.send(&CoreFrame::ConfigValidate {
+        request_id: "req-kws-off-val".into(),
+        device: "dot2-d".into(),
+        expected_gateway_boot_id: None,
+        expected_state_revision: None,
+        block: ConfigBlock::Kws,
+        schema_version: 1,
+        block_hash: "hash-kws-off".into(),
+        values: json!({
+            "keywords": "n i h ao @你好",
+            "retreat_words": [],
+            "intents_hash": "ih-off"
+        }),
+    })
+    .await;
+    let val = core
+        .until(|f| matches!(f, GatewayFrame::ConfigValidated { request_id, .. } if request_id == "req-kws-off-val"))
+        .await;
+    let GatewayFrame::ConfigValidated {
+        supported,
+        blockers,
+        ..
+    } = val
+    else {
+        unreachable!();
+    };
+    assert!(!supported);
+    assert!(
+        blockers.iter().any(|b| b == "kws_disabled"),
+        "expected kws_disabled blocker, got {blockers:?}"
+    );
+
+    core.send(&CoreFrame::ConfigApply {
+        device: "dot2-d".into(),
+        core_node_id: "core-1".into(),
+        data_epoch: 1,
+        application_id: "app-kws-off".into(),
+        operation_id: "op-kws-off".into(),
+        desired_revision: 1,
+        block_generation: 1,
+        block: ConfigBlock::Kws,
+        schema_version: 1,
+        block_hash: "hash-kws-off".into(),
+        expected_gateway_boot_id: None,
+        expected_state_revision: None,
+        capability_fingerprint: None,
+        values: json!({
+            "keywords": "n i h ao @你好",
+            "retreat_words": [],
+            "intents_hash": "ih-off"
+        }),
+    })
+    .await;
+    let receipt = core
+        .until(|f| matches!(f, GatewayFrame::ConfigReceipt { operation_id, .. } if operation_id == "op-kws-off"))
+        .await;
+    let GatewayFrame::ConfigReceipt {
+        status,
+        error_code,
+        retryable,
+        ..
+    } = receipt
+    else {
+        unreachable!();
+    };
+    assert_eq!(status, ConfigReceiptStatus::Unsupported);
+    assert_eq!(error_code.as_deref(), Some("kws_disabled"));
+    assert!(!retryable);
+
+    // 2. KWS-enabled gateway (cfg.kws == true): advertises all 4 KWS capabilities
+    //    plus `kws` schema and bounds in ConfigState.
+    let probes2 = Arc::new(Mutex::new(Probes::default()));
+    let (hw2, _btn2) = FakeHardware::new(probes2);
+    let sd2 = state_dir("cfgv2-kws-on");
+    let kws_dir = sd2.join("kws-empty");
+    std::fs::create_dir_all(&kws_dir).unwrap();
+    let (core2, port2) = spawn_fake_core().await;
+    spawn_firmware(
+        FirmwareConfig {
+            core_addr: format!("127.0.0.1:{port2}"),
+            state_dir: sd2,
+            kws: true,
+            kws_dir,
+            ..Default::default()
+        },
+        Arc::new(hw2),
+    );
+    let hello2 = core2.recv().await;
+    let GatewayFrame::Hello { devices: dev2, .. } = hello2 else {
+        panic!("expected Hello, got {hello2:?}");
+    };
+    for required in [
+        "local_exit",
+        "interrupt_wake_word",
+        "interrupt_retreat_local_exit",
+        "config_block_kws",
+    ] {
+        assert!(
+            dev2[0].capabilities.iter().any(|c| c == required),
+            "cfg.kws=true must advertise {required}: {:?}",
+            dev2[0].capabilities
+        );
+    }
+    core2
+        .send(&CoreFrame::HelloAck {
+            protocol: 2,
+            min_protocol: 0,
+            supported_versions: vec![0, 2],
+            capabilities: vec!["config_apply_v2".into()],
+            core_version: "test-v2".into(),
+            generation: 1,
+        })
+        .await;
+    core2
+        .send(&CoreFrame::ConfigStateGet {
+            request_id: "req-kws-on-state".into(),
+            device: "dot2-d".into(),
+        })
+        .await;
+    let state2 = core2
+        .until(|f| matches!(f, GatewayFrame::ConfigState { request_id, .. } if request_id == "req-kws-on-state"))
+        .await;
+    let GatewayFrame::ConfigState {
+        block_schemas: schemas2,
+        bounds: bounds2,
+        ..
+    } = state2
+    else {
+        unreachable!();
+    };
+    assert_eq!(schemas2.get("kws").and_then(|v| v.as_u64()), Some(1));
+    assert!(bounds2.get("kws").is_some());
+}

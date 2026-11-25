@@ -752,13 +752,26 @@ pub fn capability_fingerprint(capabilities: &[String]) -> String {
 }
 
 pub fn kws_model_token_hashes(kws_dir: &Path) -> (Option<String>, Option<String>) {
-    let token_hash = std::fs::read(kws_dir.join("model").join("tokens.txt"))
+    let model_dir = kws_dir.join("model");
+    let token_hash = std::fs::read(model_dir.join("tokens.txt"))
         .ok()
         .map(|b| super::fnv1a_hex(&b));
-    let model_hash = std::fs::read(kws_dir.join("model").join("encoder.onnx"))
-        .or_else(|_| std::fs::read(kws_dir.join("model").join("model.onnx")))
+    let model_bytes = std::fs::read(model_dir.join("encoder.onnx"))
+        .or_else(|_| std::fs::read(model_dir.join("model.onnx")))
         .ok()
-        .map(|b| super::fnv1a_hex(&b));
+        .or_else(|| {
+            let mut candidates: Vec<String> = std::fs::read_dir(&model_dir)
+                .ok()?
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| entry.file_name().into_string().ok())
+                .filter(|name| name.starts_with("encoder") && name.ends_with(".onnx"))
+                .collect();
+            candidates.sort();
+            candidates
+                .into_iter()
+                .find_map(|name| std::fs::read(model_dir.join(name)).ok())
+        });
+    let model_hash = model_bytes.map(|b| super::fnv1a_hex(&b));
     (model_hash, token_hash)
 }
 
@@ -895,6 +908,25 @@ mod tests {
             led.active_hash, None,
             "reboot clears active_hash until reloaded"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kws_model_token_hashes_matches_versioned_encoder_onnx() {
+        let dir = std::env::temp_dir().join(format!("hm-cj-kws-hash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let model_dir = dir.join("model");
+        std::fs::create_dir_all(&model_dir).unwrap();
+        std::fs::write(model_dir.join("tokens.txt"), "n 1\n").unwrap();
+        let enc_bytes = b"fake-int8-encoder-weights";
+        std::fs::write(
+            model_dir.join("encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx"),
+            enc_bytes,
+        )
+        .unwrap();
+        let (model_hash, token_hash) = kws_model_token_hashes(&dir);
+        assert_eq!(model_hash, Some(super::super::fnv1a_hex(enc_bytes)));
+        assert_eq!(token_hash, Some(super::super::fnv1a_hex(b"n 1\n")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

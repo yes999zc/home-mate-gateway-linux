@@ -29,8 +29,28 @@ pub const SUPPORTED_PROTOCOLS: &[u32] = &[0, 2];
 /// Maximum encoded size (bytes) for config_apply_v2 control frames (64 KiB).
 pub const MAX_CONFIG_FRAME_BYTES: usize = 64 * 1024;
 
-/// Acoustic profile version advertised by the dot2 array post-AEC pipeline.
-pub const PROFILE_VERSION: &str = "dot2-array-postaec-v1";
+/// Acoustic profile version advertised by the Dot2 array post-AEC pipeline.
+pub const DOT2_PROFILE_VERSION: &str = "dot2-array-postaec-v1";
+
+/// Acoustic profile version advertised by the LX06 array post-AEC pipeline.
+pub const LX06_PROFILE_VERSION: &str = "lx06-array-v1";
+
+/// Default acoustic profile version for this build's primary board family.
+#[cfg(all(feature = "board-lx06", not(feature = "board-dot2")))]
+pub const PROFILE_VERSION: &str = LX06_PROFILE_VERSION;
+
+/// Default acoustic profile version for this build's primary board family.
+#[cfg(not(all(feature = "board-lx06", not(feature = "board-dot2"))))]
+pub const PROFILE_VERSION: &str = DOT2_PROFILE_VERSION;
+
+/// Resolve the acoustic profile version for a configured board model.
+pub fn profile_version_for_model(model: &str) -> &'static str {
+    if model.eq_ignore_ascii_case("LX06") {
+        LX06_PROFILE_VERSION
+    } else {
+        PROFILE_VERSION
+    }
+}
 
 /// Effective configured echo tail at the fixed 16 kHz capture rate.
 /// A disabled pipeline has no effective tail.

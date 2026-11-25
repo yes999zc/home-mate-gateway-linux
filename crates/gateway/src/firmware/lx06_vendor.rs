@@ -21,8 +21,8 @@ const FINAL_CUE_WINDOW: Duration = Duration::from_millis(500);
 const STOP_WAIT: Duration = Duration::from_secs(2);
 const MAX_LOG: usize = 512 * 1024;
 
-#[derive(Default)]
 struct State {
+    local_kws_enabled: bool,
     core_online: bool,
     managed_mute: bool,
     core_mute: bool,
@@ -40,6 +40,29 @@ struct State {
     pns_checked: Option<Instant>,
     // A stop followed by an idle transition cannot reuse pre-restart evidence.
     home_confirmed: bool,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            local_kws_enabled: true,
+            core_online: false,
+            managed_mute: false,
+            core_mute: false,
+            native_mute: None,
+            core_busy: false,
+            core_active: false,
+            candidate: None,
+            playback: false,
+            reservation: None,
+            closing_until: None,
+            observed: None,
+            native_busy: false,
+            pns_running: None,
+            pns_checked: None,
+            home_confirmed: false,
+        }
+    }
 }
 
 impl State {
@@ -145,16 +168,24 @@ impl State {
         if self.core_online {
             self.core_mute = value == "muted";
         }
+        // When local KWS is enabled (256 MB mode), require a fresh local keyword
+        // candidate before letting Core reserve pns. In thin mode (no local KWS),
+        // wake detection runs on LAN Core via server-side ASR, so Core wake/listening
+        // transitions open a reservation directly whenever native XiaoAi is idle
+        // (still never preempting an active native dialog).
+        let candidate_ready =
+            !self.local_kws_enabled || self.candidate.is_some_and(|end| now < end);
         let accepted = matches!(value, "wake" | "listening" | "hearing")
-            && self.candidate.is_some_and(|end| now < end)
+            && candidate_ready
             && (self.native_available(now) || (self.closing_until.is_some() && self.owns(now)));
         // A spotted string is only a candidate. Its Core may ignore it, lose
         // multi-room arbitration or classify a local transport/retreat word.
         // Only fresh matching Core admission or an actual Play reserves pns.
-        self.core_busy = (active || matches!(value, "paused" | "error"))
-            && (self.closing_until.is_none() || accepted);
-        self.core_active =
-            (active && (held || accepted)) || (held && matches!(value, "paused" | "error"));
+        // Non-active presentations ("paused", "error", "muted", "idle") release
+        // `core_active` immediately so XiaoAi (`pns`) resumes instead of
+        // remaining starved across long paused/idle periods.
+        self.core_busy = active && (self.closing_until.is_none() || accepted);
+        self.core_active = active && (held || accepted);
         if accepted {
             self.closing_until = None;
             self.candidate = None;
@@ -165,7 +196,7 @@ impl State {
             self.closing_until = Some(now + FINAL_CUE_WINDOW);
             self.reservation = None;
         } else if (self.core_active && self.home_confirmed)
-            || (was_core_active && value == "idle")
+            || (was_core_active && !self.core_active)
             || !self.core_online
             || self.core_mute
         {
@@ -173,7 +204,7 @@ impl State {
             // Keep the reservation so KWS and capture receive the first words.
             self.reservation = None;
         }
-        if !self.core_online || self.core_mute {
+        if !self.core_online || self.core_mute || matches!(value, "paused" | "error") {
             self.closing_until = None;
         }
         if !self.core_online || self.core_mute || (self.core_busy && !self.core_active) {
@@ -192,12 +223,13 @@ pub struct VendorMonitor {
 }
 
 impl VendorMonitor {
-    pub fn start(initial_mute: bool) -> Arc<Self> {
-        Self::start_with(initial_mute, Native::device())
+    pub fn start(initial_mute: bool, local_kws_enabled: bool) -> Arc<Self> {
+        Self::start_with(initial_mute, local_kws_enabled, Native::device())
     }
-    fn new(initial_mute: bool, native: Native) -> Arc<Self> {
+    fn new(initial_mute: bool, local_kws_enabled: bool, native: Native) -> Arc<Self> {
         Arc::new(Self {
             state: Mutex::new(State {
+                local_kws_enabled,
                 managed_mute: initial_mute,
                 native_mute: native.mute_marker(),
                 ..State::default()
@@ -206,8 +238,8 @@ impl VendorMonitor {
             changed: Condvar::new(),
         })
     }
-    fn start_with(initial_mute: bool, native: Native) -> Arc<Self> {
-        let monitor = Self::new(initial_mute, native);
+    fn start_with(initial_mute: bool, local_kws_enabled: bool, native: Native) -> Arc<Self> {
+        let monitor = Self::new(initial_mute, local_kws_enabled, native);
         let weak = Arc::downgrade(&monitor);
         std::thread::spawn(move || {
             let mut journal = Journal::default();
@@ -675,7 +707,7 @@ impl VendorMonitor {
         self.state.lock().unwrap().wants_pns(Instant::now())
     }
     pub(super) fn test_observer(native_busy: bool, home_owns: bool) -> Arc<Self> {
-        let monitor = Self::new(false, Native::fixture());
+        let monitor = Self::new(false, true, Native::fixture());
         {
             let mut state = monitor.state.lock().unwrap();
             let now = Instant::now();
@@ -810,7 +842,7 @@ mod tests {
         assert!(!s.wants_pns(late));
         s.refresh(late, Some(false), Some(false), Some(false));
         assert!(s.owns(late));
-        for presentation in ["paused", "error", "thinking", "hearing"] {
+        for presentation in ["thinking", "hearing", "speaking", "music", "playing"] {
             s.core_state(presentation, late);
             assert!(s.owns(late));
         }
@@ -919,7 +951,7 @@ esac"#,
         };
         fs::write(&running, "").unwrap();
         fs::write(&player, "0").unwrap();
-        let monitor = VendorMonitor::start_with(false, n);
+        let monitor = VendorMonitor::start_with(false, true, n);
         monitor.assistant_state("idle");
         assert!(monitor.vendor_owns(), "missing journal is unknown");
         fs::write(&journal, "").unwrap();
@@ -1048,5 +1080,131 @@ esac"#,
         );
         fs::remove_file(&path).unwrap();
         fs::remove_file(rotated).unwrap();
+    }
+
+    #[test]
+    fn thin_mode_without_local_kws_admits_server_asr_wake_and_followup_turns() {
+        use super::super::lx06::IndicatorOwner;
+
+        let monitor = VendorMonitor::new(false, false, Native::fixture());
+        let now = Instant::now();
+        {
+            let mut s = monitor.state.lock().unwrap();
+            s.core_state("idle", now);
+            s.refresh(now, Some(false), Some(true), Some(false));
+            assert!(s.may_capture(now), "idle thin gateway must stream PCM");
+            assert!(s.wants_pns(now));
+        }
+        assert_eq!(monitor.indicator_owner(), IndicatorOwner::Idle);
+
+        // Server-side ASR wake arrives with NO prior observe_home_candidate().
+        {
+            let mut s = monitor.state.lock().unwrap();
+            s.core_state("wake", now);
+            assert!(
+                s.core_active,
+                "server-ASR wake must activate Home turn in thin mode"
+            );
+            assert!(
+                s.may_capture(now),
+                "thin gateway must keep capturing while pns stops"
+            );
+            assert!(!s.wants_pns(now), "thin gateway must request pns pause");
+            // Listening arrives before pns stop readback completes.
+            s.core_state("listening", now);
+            assert!(s.core_active);
+            assert!(s.may_capture(now));
+            // Worker stops pns and reports pns_running = Some(false).
+            s.refresh(now, Some(false), Some(false), Some(false));
+            assert!(s.owns(now));
+            assert!(s.may_capture(now));
+        }
+        assert_eq!(monitor.indicator_owner(), IndicatorOwner::Home);
+
+        // Core transitions speaking -> follow-up listening -> idle.
+        {
+            let mut s = monitor.state.lock().unwrap();
+            s.core_state("speaking", now);
+            assert!(s.owns(now));
+            assert!(s.may_capture(now));
+
+            s.core_state("listening", now);
+            assert!(s.owns(now), "follow-up listening must preserve ownership");
+            assert!(s.may_capture(now), "follow-up listening must stay audible");
+
+            s.core_state("idle", now);
+            // Final cue window still holds ownership briefly, then releases.
+            assert!(s.owns(now));
+            let after_close = now + FINAL_CUE_WINDOW;
+            assert!(s.wants_pns(after_close));
+            s.refresh(after_close, Some(false), Some(true), Some(false));
+            assert!(!s.owns(after_close));
+            assert!(s.idle(after_close));
+            assert!(s.may_capture(after_close));
+        }
+        assert_eq!(monitor.indicator_owner(), IndicatorOwner::Idle);
+    }
+
+    #[test]
+    fn thin_mode_without_local_kws_never_preempts_active_native_xiaoai_dialog() {
+        use super::super::lx06::IndicatorOwner;
+
+        let monitor = VendorMonitor::new(false, false, Native::fixture());
+        let now = Instant::now();
+        {
+            let mut s = monitor.state.lock().unwrap();
+            s.core_state("idle", now);
+            s.refresh(now, Some(true), Some(true), Some(false));
+            assert!(!s.may_capture(now));
+            assert!(s.wants_pns(now));
+
+            for state_name in ["wake", "listening", "hearing"] {
+                s.core_state(state_name, now);
+                assert!(
+                    !s.core_active,
+                    "thin mode must not activate Home during native dialog ({state_name})"
+                );
+                assert!(!s.owns(now));
+                assert!(!s.wants_home(now));
+                assert!(
+                    s.wants_pns(now),
+                    "must never pause pns during native dialog"
+                );
+            }
+        }
+        assert_eq!(monitor.indicator_owner(), IndicatorOwner::Native);
+    }
+
+    #[test]
+    fn paused_and_error_release_core_active_and_resume_pns_immediately() {
+        for state_name in ["paused", "error"] {
+            let now = Instant::now();
+            let mut s = State::default();
+            s.core_state("idle", now);
+            s.refresh(now, Some(false), Some(true), Some(false));
+            assert!(s.candidate(now));
+            s.core_state("wake", now);
+            s.refresh(now, Some(false), Some(false), Some(false));
+            s.core_state("playing", now);
+            assert!(s.core_active);
+            assert!(s.owns(now));
+            assert!(!s.wants_pns(now));
+
+            // Entering paused/error must release Home ownership immediately so
+            // native XiaoAi (pns) resumes without waiting for a program TTL.
+            s.core_state(state_name, now);
+            assert!(s.core_online, "{state_name} keeps core_online");
+            assert!(!s.core_active, "{state_name} must clear core_active");
+            assert!(!s.core_busy, "{state_name} must clear core_busy");
+            assert!(!s.owns(now), "{state_name} must release Home ownership");
+            assert!(
+                s.wants_pns(now),
+                "{state_name} must resume pns immediately without waiting"
+            );
+
+            // Once pns restarts, the device returns to idle dual-wake readiness.
+            s.refresh(now, Some(false), Some(true), Some(false));
+            assert!(s.idle(now), "device must be idle after pns resumes");
+        }
     }
 }
