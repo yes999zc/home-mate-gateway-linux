@@ -194,6 +194,9 @@ unpack_bundle_if_needed() {
         if [ -f "$HM_RUN_DIR/.lx06-idle-wake-v1" ] && [ -x "$HM_RUN_DIR/hm-core" ] &&
             [ -x "$HM_RUN_DIR/hm-gateway" ] &&
             [ "$(cat "$HM_RUN_DIR/.main-sha256" 2>/dev/null)" = "$main_digest" ]; then
+            if is_standalone_asr_mode && [ -f "$HM_RUN_DIR/silero_vad.onnx" ]; then
+                rm -f "$HM_RUN_DIR/silero_vad.onnx"
+            fi
             return 0
         fi
     fi
@@ -230,6 +233,9 @@ unpack_bundle_if_needed() {
     mv "$stage" "$HM_RUN_DIR" || return 1
     if [ "$thin" = 0 ] && ! is_standalone_asr_mode && [ -s "$HM_RUN_DIR/silero_vad.onnx" ]; then
         ln -sf "$HM_RUN_DIR/silero_vad.onnx" "$HM_STATE_DIR/models/silero_vad.onnx"
+    elif is_standalone_asr_mode && [ -f "$HM_RUN_DIR/silero_vad.onnx" ]; then
+        # Free ~2.3 MiB of 58 MB RAM-backed /tmp tmpfs in 128 MB standalone-asr mode.
+        rm -f "$HM_RUN_DIR/silero_vad.onnx"
     fi
 }
 
@@ -539,7 +545,7 @@ run_supervisor() {
     while true; do
         supervise_tick
         # Keep runtime logs and loopback dumps from crowding the RAM-backed KWS and main bundles.
-        use=$(df -k /tmp | sed -n 2p | tr -s " " | cut -d " " -f5 | tr -d "%")
+        use=$(df -Pk /tmp 2>/dev/null | awk 'NR==2 {gsub(/%/,"",$5); print $5}')
         if [ "${use:-0}" -ge 85 ]; then
             : > "$CORE_LOG"
             : > "$GW_LOG"

@@ -728,4 +728,7 @@ pub enum Chan {
 /// number that matters is the answer length, not the wall clock, so the cap
 /// now admits a 3-minute answer: 180 s at 48k mono i16 ≈ 17 MB pending, still
 /// small against this device's memory and bounded per channel.
+#[cfg(feature = "board-lx06")]
+const STREAM_AHEAD_LIMIT: u64 = 45 * 48_000;
+#[cfg(not(feature = "board-lx06"))]
 const STREAM_AHEAD_LIMIT: u64 = 180 * 48_000;

@@ -116,6 +116,7 @@ pub(super) async fn north_connect_and_serve(
     )
     .await
     .map_err(|_| format!("core dial timed out after {CONNECT_TIMEOUT_MS} ms"))??;
+    let _ = stream.set_nodelay(true);
     let (rd, wr) = stream.into_split();
 
     let generation = lock_or_fault(&role.shared, Some(&role.fault), "north.shared")

@@ -47,7 +47,7 @@ checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
 
 [[package]]
 name = "home-mate-device-gateway"
-version = "0.0.54"
+version = "0.0.55"
 dependencies = [
  "base64",
  "cc",

@@ -93,11 +93,11 @@
 # 1. 在 NAS / 服务器部署标准全量版 Docker hm-core（开启 HM_GATEWAY_ALLOW_LAN=1，并在 :8930 配对令牌）
 git clone https://github.com/yes999zc/home-mate.git && cd home-mate && docker compose up -d
 
-# 2. 免编译下载 v0.0.54 瘦网关成品包并安装到 128 MB LX06（也可运行 ./tools/pack_lx06_bundle.sh --thin 自行编译）
+# 2. 免编译下载 v0.0.55 瘦网关成品包并安装到 128 MB LX06（也可运行 ./tools/pack_lx06_bundle.sh --thin 自行编译）
 git clone https://github.com/yes999zc/home-mate-gateway-linux.git && cd home-mate-gateway-linux
 mkdir -p build/lx06
 for f in hm-lx06-thin.tar.xz hm-lx06-thin.sha256 init.sh unxz SHA256SUMS.txt; do
-  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.54/$f" -o "build/lx06/$f"
+  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.55/$f" -o "build/lx06/$f"
 done
 (cd build/lx06 && grep -E 'hm-lx06-thin|init\.sh|unxz' SHA256SUMS.txt | shasum -a 256 -c -)
 chmod +x build/lx06/init.sh build/lx06/unxz
@@ -114,11 +114,11 @@ chmod +x build/lx06/init.sh build/lx06/unxz
 如果手里**没有 NAS / 常开服务器**，128 MB LX06 也可以直接跳过吃掉 `50~68 MiB` 内存的本地 `hm-kws`，在本机独立运行 **`hm-core --slim`（自动禁用 `/tmp/hm-voice-events` 防撑爆 58 MB `/tmp`）+ `hm-gateway` + `:8930` 控制台**（合计净吃 `~26–31 MiB` RAM，保留 `~22–30 MiB` 安全余量，`/data` 需 ≥ `5.5 MiB` 空闲）：
 
 ```bash
-# 1. 免编译下载 v0.0.54 主包（也可运行 ./tools/pack_lx06_bundle.sh --standalone-asr 自行编译）
+# 1. 免编译下载 v0.0.55 主包（也可运行 ./tools/pack_lx06_bundle.sh --standalone-asr 自行编译）
 git clone https://github.com/yes999zc/home-mate-gateway-linux.git && cd home-mate-gateway-linux
 mkdir -p build/lx06
 for f in hm-bundle.tar.xz hm-bundle.sha256 init.sh unxz SHA256SUMS.txt; do
-  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.54/$f" -o "build/lx06/$f"
+  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.55/$f" -o "build/lx06/$f"
 done
 (cd build/lx06 && grep -E 'hm-bundle|init\.sh|unxz' SHA256SUMS.txt | shasum -a 256 -c -)
 chmod +x build/lx06/init.sh build/lx06/unxz
@@ -241,5 +241,6 @@ cargo test --workspace --all-features --all-targets --locked -- --test-threads=1
 与 [`yes999zc/home-mate`](https://github.com/yes999zc/home-mate) 保持统一双许可模型：
 - **开源使用**：**GNU Affero General Public License v3.0 (`AGPL-3.0-only`)**（[`LICENSE`](LICENSE)）。
 - **北向 v2 协议例外**：**Apache License 2.0**（[`LICENSE-PROTOCOL-APACHE-2.0`](LICENSE-PROTOCOL-APACHE-2.0)，详见 [`LICENSING.md`](LICENSING.md)）。
+- **移植新主板（如小米 `OH2P`）**：参考 [`docs/PORTING.md`](docs/PORTING.md)。
 - **商业授权 / OEM 预装**：请联系 `zhangcong1985@gmail.com` / `yes999zc@163.com`（官网：[https://mymate.homes](https://mymate.homes)）。
 - 第三方依赖许可致谢见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
