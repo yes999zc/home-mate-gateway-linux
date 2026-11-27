@@ -26,6 +26,7 @@ KWS_PERSIST_FILES="kw.txt kw.exit.json kw.tuning.json kw.bundle.json"
 KWS_SYNC_BACKOFF_MAX=60
 kws_sync_fail_streak=0
 kws_sync_cooldown=0
+kws_retry_at=0
 
 # 128 MB RAM LX06 batch (MemTotal ~118,760 kB, /tmp tmpfs ~59 MB) cannot host
 # on-device hm-core + hm-kws without OOM.
@@ -337,6 +338,46 @@ sync_kws_config() {
     return 0
 }
 
+kws_runtime_ready() {
+    [ -s "$HM_FLASH_DIR/kws.sha256" ] || return 1
+    digest=$(cat "$HM_FLASH_DIR/kws.sha256")
+    case "$digest" in *[!0-9a-f]*) return 1 ;; esac
+    [ "${#digest}" -eq 64 ] || return 1
+    [ -x "$KWS_DIR/run.sh" ] && [ -x "$KWS_DIR/hm-kws" ] &&
+        [ "$(cat "$KWS_DIR/.archive-sha256" 2>/dev/null)" = "$digest" ]
+}
+
+# Fetch and verify the KWS archive without ever blocking the 1 Hz supervisor
+# tick. Uses an atomic lock directory created before fork and removed by the
+# child on exit (avoiding parent/child PID-file races and Linux zombie kill -0
+# false positives). Once atomically unpacked into $KWS_DIR, hm-gateway's
+# built-in kws::supervise() detects run.sh and hot-starts local KWS in place
+# (zero gateway restart, zero audio interruption, zero Core HTTP polling).
+ensure_kws_fetch_async() {
+    if kws_runtime_ready; then
+        restore_kws_config || true
+        return 0
+    fi
+    lock_dir="$HM_RUN_DIR/.kws-fetch.lock"
+    now_s=$(date +%s)
+    # Guard against backward NTP jumps on RTC-less LX06 boots.
+    if [ "${kws_retry_at:-0}" -gt $((now_s + 60)) ]; then
+        kws_retry_at=0
+    fi
+    if [ "$now_s" -lt "${kws_retry_at:-0}" ]; then
+        return 0
+    fi
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        return 0
+    fi
+    kws_retry_at=$((now_s + 60))
+    (
+        fetch_kws_if_needed || true
+        rmdir "$lock_dir" 2>/dev/null || true
+    ) &
+    return 0
+}
+
 fetch_kws_if_needed() {
     [ -s "$HM_FLASH_DIR/kws.sha256" ] || return 1
     digest=$(cat "$HM_FLASH_DIR/kws.sha256")
@@ -515,10 +556,13 @@ supervise_tick() {
             HM_LOOP_DIR=/tmp/hm-loop "$HM_RUN_DIR/hm-core" >> "$CORE_LOG" 2>&1 &
     fi
 
+    # Keep KWS archive acquisition completely non-blocking and decoupled from
+    # gateway startup: hm-gateway runs with --kws even when /tmp/hm-kws is not
+    # yet downloaded, reporting kws.state="off" and allowing Core ASR wake
+    # fallback until hm-kws appears and hot-starts in place.
+    ensure_kws_fetch_async
+
     if ! runtime_pid hm-gateway firmware >/dev/null; then
-        if ! fetch_kws_if_needed; then
-            return 1
-        fi
         dev_id="lx06"
         if [ -s "$HM_STATE_DIR/device-id" ]; then
             id_val=$(tr -d '\r\n ' < "$HM_STATE_DIR/device-id")
@@ -534,7 +578,9 @@ supervise_tick() {
             --loopback-probe --kws --kws-dir "$KWS_DIR" --kws-cpu 3 \
             --volume-cap "$vol_cap" >> "$GW_LOG" 2>&1 &
     else
-        sync_kws_config || true
+        if kws_runtime_ready; then
+            sync_kws_config || true
+        fi
     fi
 }
 

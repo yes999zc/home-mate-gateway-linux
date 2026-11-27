@@ -377,3 +377,33 @@ fn vad_event_parses_and_tristate_decodes() {
     assert_eq!(decode_vad_state(VAD_SILENCE), Some(false));
     assert_eq!(decode_vad_state(VAD_SPEECH), Some(true));
 }
+
+#[test]
+fn reconcile_bundle_meta_respects_flash_floor_when_tmpfs_missing_or_stale() {
+    let floor = (Some("flash-b7".to_string()), 7u64);
+    // 1. Clean tmpfs (no kw.bundle.json yet) inherits the persisted flash floor.
+    assert_eq!(
+        reconcile_bundle_meta("", 0, None, Some(&floor)),
+        ("flash-b7".to_string(), 7)
+    );
+    // 2. Stale backup on tmpfs (gen 4 < flash floor 7) must never regress below 7.
+    assert_eq!(
+        reconcile_bundle_meta("", 0, Some(("stale-b4".to_string(), 4)), Some(&floor)),
+        ("flash-b7".to_string(), 7)
+    );
+    // 3. Newer tmpfs bundle (gen 9 >= flash floor 7) advances cleanly.
+    assert_eq!(
+        reconcile_bundle_meta(
+            "flash-b7",
+            7,
+            Some(("fresh-b9".to_string(), 9)),
+            Some(&floor)
+        ),
+        ("fresh-b9".to_string(), 9)
+    );
+    // 4. Subsequent spawn without file keeps live status generation >= floor.
+    assert_eq!(
+        reconcile_bundle_meta("fresh-b9", 9, None, Some(&floor)),
+        ("fresh-b9".to_string(), 9)
+    );
+}

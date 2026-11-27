@@ -135,12 +135,62 @@ test ! -s "$NATIVE_LOG_DIR/instruction.log"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(instruction.read_bytes(), b"active dialog")
 
-    def test_wrong_keyword_archive_never_starts_gateway(self):
+    def test_wrong_keyword_archive_keeps_gateway_online_without_loading_unverified_kws(self):
         (self.flash / "kws.sha256").write_text("0" * 64)
-        result = self.run_shell("if supervise_tick; then exit 9; fi; wait")
+        result = self.run_shell("supervise_tick; wait")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.root / "hm-kws/run.sh").exists())
-        self.assertNotIn(" 1 firmware ", (self.root / "starts").read_text())
+        starts = (self.root / "starts").read_text()
+        self.assertIn(" 1 firmware ", starts)
+        # Gateway stays launched with --kws so kws::supervise() reports state="off"
+        # honestly, keeps acoustic echo guard armed, and hot-starts once verified.
+        self.assertIn("--kws --kws-dir ", starts)
+
+    def test_missing_keyword_host_recovers_in_background_without_restarting_gateway(self):
+        persist_dir = self.flash / "state/kws-persist"
+        persist_dir.mkdir(parents=True, exist_ok=True)
+        (persist_dir / "kw.txt").write_text("n i h ao @你好\n")
+        (self.flash / "kws.url").write_text((self.root / "absent.tar.xz").as_uri())
+        result = self.run_shell("""
+supervise_tick
+wait
+test ! -e "$KWS_DIR/run.sh"
+# Simulate gateway now running in-place; sync_kws_config must not erase flash backup.
+runtime_pid() { [ "$2" = firmware ] && echo 123; }
+supervise_tick
+test -s "$HM_STATE_DIR/kws-persist/kw.txt"
+# Restore archive URL and trigger next retry window; fetch recovers in background
+# without ever killing/restarting hm-gateway.
+printf '%s' "$RECOVER_URL" > "$HM_FLASH_DIR/kws.url"
+kws_retry_at=0
+supervise_tick
+wait
+test -x "$KWS_DIR/run.sh"
+test -s "$KWS_DIR/kw.txt"
+! grep -qx 'stop firmware' "$FIXTURE/services" 2>/dev/null
+""".replace("$RECOVER_URL", (self.root / "kws.tar.xz").as_uri()))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        starts = (self.root / "starts").read_text()
+        self.assertEqual(starts.count(" 1 firmware "), 1)
+        self.assertIn("--kws --kws-dir ", starts)
+
+    def test_async_kws_fetch_does_not_overlap_or_block_supervise_tick(self):
+        (self.flash / "kws.url").write_text((self.root / "kws.tar.xz").as_uri())
+        result = self.run_shell("""
+curl() {
+    echo fetch >> "$FIXTURE/fetches"
+    sleep 0.2
+    command curl "$@"
+}
+supervise_tick
+# Second tick while fetch is still in flight must return immediately and not overlap.
+kws_retry_at=0
+supervise_tick
+wait
+test -x "$KWS_DIR/run.sh"
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "fetches").read_text().splitlines(), ["fetch"])
 
     def test_legacy_native_selection_starts_dual_but_explicit_pin_persists(self):
         (self.flash / "mode").write_text("xiaoai\n")
@@ -179,15 +229,19 @@ test ! -s "$NATIVE_LOG_DIR/instruction.log"
     def test_bad_download_retries_without_replacing_main_bundle(self):
         (self.flash / "kws.url").write_text((self.root / "absent").as_uri())
         r = self.run_shell("""
-if supervise_tick; then exit 9; fi
+supervise_tick
 wait
 test ! -e "$KWS_DIR/run.sh"
 printf '%s' "$RECOVER_URL" > "$HM_FLASH_DIR/kws.url"
+kws_retry_at=0
+runtime_pid() { [ "$2" = firmware ] && echo 123; }
 supervise_tick
 wait
+test -x "$KWS_DIR/run.sh"
 """.replace("$RECOVER_URL", (self.root / "kws.tar.xz").as_uri()))
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual((self.root / "starts").read_text().count(" 1 firmware "), 1)
+        self.assertEqual((self.root / "count").read_text().splitlines(), ["unpack"] * 2)
 
     def test_pinned_native_honors_management_mute_even_with_broken_bundle(self):
         (self.flash / "hm-bundle.tar.xz").write_bytes(b"truncated")

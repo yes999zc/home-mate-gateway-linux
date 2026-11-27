@@ -31,12 +31,28 @@ pub(super) fn handle_kws_lifecycle(
     state_dir: &std::path::Path,
     ev: kws::KwsLifecycleEvent,
 ) {
+    #[cfg(feature = "board-lx06")]
+    {
+        let kws_ready = matches!(ev, kws::KwsLifecycleEvent::Ready { .. });
+        let vendor = shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .vendor
+            .clone();
+        if let Some(v) = vendor {
+            v.set_local_kws_ready(kws_ready);
+        }
+    }
+    if matches!(ev, kws::KwsLifecycleEvent::Unavailable) {
+        return;
+    }
     let (receipt_frame, north) = {
         let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
         let Some(pending) = sh.pending_kws_receipt.take() else {
             return;
         };
         match ev {
+            kws::KwsLifecycleEvent::Unavailable => unreachable!(),
             kws::KwsLifecycleEvent::Ready {
                 reload_gen,
                 load_ms,
@@ -125,17 +141,25 @@ impl Role {
         };
         let bundle_id =
             fnv1a_hex(format!("{kw_hash}:{intents_hash}:{tuning_str}:{local_exit}").as_bytes());
-        let status = lock_or_fault(&self.shared, Some(&self.fault), "role.shared")
-            .kws_status
-            .clone();
-        let next_gen = if let Some(ref st_arc) = status {
+        let (status, journal_kws_gen) = {
+            let sh = lock_or_fault(&self.shared, Some(&self.fault), "role.shared");
+            (
+                sh.kws_status.clone(),
+                sh.config_journal.active_kws_bundle().1,
+            )
+        };
+        let status_gen = if let Some(ref st_arc) = status {
             let st = st_arc
                 .lock()
                 .map_err(|_| "kws_status poisoned".to_string())?;
-            st.bundle_generation.saturating_add(1)
+            st.bundle_generation
         } else {
-            1
+            0
         };
+        // Anchor monotonicity to both in-memory sidecar state and flash-persisted
+        // `config_journal.json`, so wiping `/tmp/hm-kws` can never regress
+        // `kws_generation` below Core's active fence.
+        let next_gen = status_gen.max(journal_kws_gen).saturating_add(1);
         kws::write_bundle_meta(dir, &bundle_id, next_gen)?;
         if let Some(st_arc) = status {
             if let Ok(mut st) = st_arc.lock() {
@@ -658,6 +682,23 @@ impl Role {
                         false,
                     );
                     let _ = direct_tx.send_ctrl(r.into_frame());
+                    return;
+                }
+                if !kws::script_ready(&kws_dir.join("run.sh")) {
+                    let r = make_receipt(
+                        boot_id,
+                        state_rev,
+                        ConfigReceiptStatus::Failed,
+                        None,
+                        None,
+                        None,
+                        Some(serde_json::json!({
+                            "detail": format!("keyword sidecar not installed: {}", kws_dir.join("run.sh").display()),
+                        })),
+                        Some("kws_sidecar_unavailable".into()),
+                        true,
+                    );
+                    self.record_and_send_receipt(r, None, direct_tx);
                     return;
                 }
                 let v = match config_journal::validate_kws(&values, &kws_dir) {

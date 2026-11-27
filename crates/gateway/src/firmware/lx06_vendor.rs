@@ -293,6 +293,17 @@ impl VendorMonitor {
         self.changed.notify_all();
     }
 
+    pub fn set_local_kws_ready(&self, ready: bool) {
+        let mut s = self.state.lock().unwrap();
+        if s.local_kws_enabled != ready {
+            s.local_kws_enabled = ready;
+            if !ready {
+                s.candidate = None;
+            }
+            self.changed.notify_all();
+        }
+    }
+
     pub fn observe_home_candidate(&self) -> bool {
         if !self.native.dual_mode() || self.native_muted_now() {
             return false;
@@ -1205,6 +1216,66 @@ esac"#,
             // Once pns restarts, the device returns to idle dual-wake readiness.
             s.refresh(now, Some(false), Some(true), Some(false));
             assert!(s.idle(now), "device must be idle after pns resumes");
+        }
+    }
+
+    #[test]
+    fn dynamic_local_kws_ready_enables_asr_fallback_and_hot_upgrades_without_interrupting_turn() {
+        let monitor = VendorMonitor::new(false, false, Native::fixture());
+        let now = Instant::now();
+        {
+            let mut s = monitor.state.lock().unwrap();
+            s.core_state("idle", now);
+            s.refresh(now, Some(false), Some(true), Some(false));
+            // 1. Before KWS sidecar is ready (local_kws_enabled == false), Core
+            //    ASR wake reserves pns directly when XiaoAi is idle.
+            s.core_state("wake", now);
+            assert!(
+                s.core_active,
+                "ASR fallback wake must activate when KWS is off"
+            );
+            assert!(!s.wants_pns(now));
+            s.refresh(now, Some(false), Some(false), Some(false));
+            assert!(s.owns(now));
+        }
+
+        // 2. KWS archive finishes downloading and hm-kws reports ready mid-turn:
+        //    flipping local_kws_ready(true) must NOT interrupt the live conversation.
+        monitor.set_local_kws_ready(true);
+        {
+            let mut s = monitor.state.lock().unwrap();
+            s.core_state("speaking", now);
+            assert!(s.owns(now), "hot KWS ready must not disrupt ongoing turn");
+            assert!(!s.wants_pns(now));
+            // Turn ends -> back to idle.
+            s.core_state("idle", now);
+            let later = now + FINAL_CUE_WINDOW;
+            s.refresh(later, Some(false), Some(true), Some(false));
+            assert!(s.idle(later));
+
+            // 3. Now that local KWS is ready, Core wake WITHOUT a local KWS
+            //    candidate is gated again.
+            s.core_state("wake", later);
+            assert!(
+                !s.core_active,
+                "once KWS is ready, idle Core wake requires a fresh local candidate"
+            );
+            assert!(s.wants_pns(later));
+        }
+
+        // 4. If KWS sidecar subsequently exits/becomes unavailable, ASR fallback
+        //    is dynamically re-enabled without restarting hm-gateway.
+        monitor.set_local_kws_ready(false);
+        {
+            let mut s = monitor.state.lock().unwrap();
+            let later = now + FINAL_CUE_WINDOW + Duration::from_secs(1);
+            s.core_state("idle", later);
+            s.refresh(later, Some(false), Some(true), Some(false));
+            s.core_state("wake", later);
+            assert!(
+                s.core_active,
+                "losing KWS sidecar dynamically re-enables ASR wake fallback"
+            );
         }
     }
 }

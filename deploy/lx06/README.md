@@ -83,6 +83,13 @@ Behavior & trade-offs in Standalone Pure-ASR mode:
 
 ## Verification & Device Acceptance
 
+### Full-mode KWS cold-boot availability & zero-restart hot recovery
+
+In 256 MB full mode the KWS runtime lives in `/tmp/hm-kws` and is fetched after a reboot. If its archive host is unreachable or SHA-256 verification fails, the supervisor never blocks gateway startup and never loads an unverified archive:
+- `init.sh` starts `hm-gateway` immediately with `--kws --kws-dir /tmp/hm-kws` (keeping microphones, playback, buttons, acoustic echo guard, and Core status online) and retries KWS download asynchronously in the background every 60 s without blocking the 1 Hz supervisor loop.
+- While `/tmp/hm-kws/run.sh` is absent, `hm-gateway`'s built-in `kws::supervise()` reports `kws.state = "off"` honestly to Core/Console, and `VendorMonitor` dynamically relaxes its local-KWS candidate gate so Core's existing `proactive_asr_wake` policy (if enabled by the user) can wake Home Mate without preempting active native XiaoAi dialogs.
+- Once a verified KWS archive is atomically unpacked into `/tmp/hm-kws` (with persisted `kws-persist/*` config restored), `kws::supervise()` automatically hot-starts `hm-kws` in place within seconds and flips `VendorMonitor` back to local-KWS gating — with **zero gateway restart**, zero TCP disconnect, and zero audio interruption.
+
 Run host-side supervisor tests covering 256 MB full mode, 128 MB thin mode, and 128 MB standalone pure-ASR mode (cold boot, cache reuse, mode precedence, `HM_VOICE_EVENTS=0`, thin bundle, full-bundle stripping, `core.addr`/`core.token`, `< 180000 kB` auto-detection, and `install-lx06.sh` CLI conflict checks):
 
 ```sh

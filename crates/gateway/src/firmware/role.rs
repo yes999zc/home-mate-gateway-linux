@@ -590,7 +590,10 @@ impl Firmware {
         #[cfg(feature = "board-lx06")]
         let vendor = (cfg.profile.model == "LX06"
             && std::env::var("HM_LX06_DUAL_WAKE").as_deref() == Ok("1"))
-        .then(|| lx06_vendor::VendorMonitor::start(muted, cfg.kws));
+        .then(|| {
+            let initial_kws_ready = cfg.kws && kws::script_ready(&cfg.kws_dir.join("run.sh"));
+            lx06_vendor::VendorMonitor::start(muted, initial_kws_ready)
+        });
         {
             let mut sh = shared.lock().unwrap_or_else(|e| e.into_inner());
             sh.volume = vol;
@@ -859,6 +862,11 @@ impl Firmware {
                 (cfg.profile.model == "LX06").then(|| lx06_keyword_admission(shared.clone()));
             #[cfg(not(feature = "board-lx06"))]
             let admit: Option<kws::HitAdmission> = None;
+            let journal_kws_floor = {
+                let sh = shared.lock().unwrap_or_else(|e| e.into_inner());
+                let (id, gen) = sh.config_journal.active_kws_bundle();
+                (gen > 0 || id.is_some()).then_some((id, gen))
+            };
             let feed = kws::spawn_with_admission(
                 cfg.kws_dir.clone(),
                 cfg.kws_cpu,
@@ -869,6 +877,7 @@ impl Firmware {
                 Some(on_retreat),
                 admit,
                 Some(on_lifecycle),
+                journal_kws_floor,
             );
             fwlog!(
                 "[kws] sidecar enabled: {} (cpu{})",

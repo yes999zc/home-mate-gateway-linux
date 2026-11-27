@@ -243,6 +243,42 @@ impl ConfigJournal {
         }
     }
 
+    /// Return the persisted active KWS `(bundle_id, kws_generation)` floor from
+    /// flash (`config_journal.json`), checking both `active_values` and
+    /// `persisted_values` (because `ConfigJournal::load()` intentionally clears
+    /// `active_values` across reboots while keeping `persisted_values`). This
+    /// keeps KWS bundle generations strictly monotonic even across reboots when
+    /// volatile tmpfs `/tmp/hm-kws/kw.bundle.json` is lost.
+    pub fn active_kws_bundle(&self) -> (Option<String>, u64) {
+        fn extract(vals: Option<&serde_json::Value>) -> (Option<String>, u64) {
+            let Some(vals) = vals else {
+                return (None, 0);
+            };
+            let bundle_id = vals
+                .get("bundle_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(ToOwned::to_owned);
+            let generation = vals
+                .get("kws_generation")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            (bundle_id, generation)
+        }
+        let Some(entry) = self.blocks.get(&ConfigBlock::Kws) else {
+            return (None, 0);
+        };
+        let (active_id, active_gen) = extract(entry.active_values.as_ref());
+        let (persisted_id, persisted_gen) = extract(entry.persisted_values.as_ref());
+        if active_gen >= persisted_gen && active_gen > 0 {
+            (active_id.or(persisted_id), active_gen)
+        } else if persisted_gen > 0 {
+            (persisted_id.or(active_id), persisted_gen)
+        } else {
+            (active_id.or(persisted_id), 0)
+        }
+    }
+
     pub fn block_states(&self) -> Vec<ConfigBlockState> {
         [
             ConfigBlock::Kws,
@@ -927,6 +963,66 @@ mod tests {
         let (model_hash, token_hash) = kws_model_token_hashes(&dir);
         assert_eq!(model_hash, Some(super::super::fnv1a_hex(enc_bytes)));
         assert_eq!(token_hash, Some(super::super::fnv1a_hex(b"n 1\n")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_kws_bundle_exposes_persisted_generation_floor() {
+        let mut j = ConfigJournal::default();
+        assert_eq!(j.active_kws_bundle(), (None, 0));
+
+        let r = ConfigReceiptData {
+            device: "lx06".into(),
+            gateway_boot_id: "boot-1".into(),
+            operation_id: "op-kws-7".into(),
+            application_id: "app-1".into(),
+            data_epoch: 1,
+            desired_revision: 33,
+            block_generation: 331,
+            block: ConfigBlock::Kws,
+            block_hash: "h-kws".into(),
+            state_revision: 7,
+            status: ConfigReceiptStatus::Active,
+            persisted_hash: Some("h-kws".into()),
+            active_hash: Some("h-kws".into()),
+            active_values: Some(json!({
+                "bundle_id": "bundle-7",
+                "kws_generation": 7,
+            })),
+            evidence: None,
+            error_code: None,
+            retryable: false,
+        };
+        j.record_terminal(&r, r.active_values.clone());
+        assert_eq!(j.active_kws_bundle(), (Some("bundle-7".into()), 7));
+
+        // A later Failed receipt must keep the persisted floor intact.
+        let fail = ConfigReceiptData {
+            operation_id: "op-kws-8".into(),
+            block_generation: 341,
+            status: ConfigReceiptStatus::Failed,
+            active_hash: None,
+            active_values: None,
+            error_code: Some("kws_reload_timeout".into()),
+            retryable: true,
+            ..r
+        };
+        j.record_terminal(&fail, None);
+        assert_eq!(j.active_kws_bundle(), (Some("bundle-7".into()), 7));
+
+        // Reboot persistence: `ConfigJournal::load()` intentionally clears
+        // `active_values` across boots, yet `active_kws_bundle()` must still
+        // recover the persisted generation floor from flash (`persisted_values`).
+        let dir = std::env::temp_dir().join(format!("hm-cj-kws-floor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        j.save(&dir).unwrap();
+        let reloaded = ConfigJournal::load(&dir);
+        assert_eq!(
+            reloaded.blocks[&ConfigBlock::Kws].active_values,
+            None,
+            "load clears active_values on reboot"
+        );
+        assert_eq!(reloaded.active_kws_bundle(), (Some("bundle-7".into()), 7));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

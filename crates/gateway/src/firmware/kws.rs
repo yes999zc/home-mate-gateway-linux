@@ -39,8 +39,8 @@ pub const QUEUE_BLOCKS: usize = 8;
 const BACKOFF_SECS: [u64; 5] = [1, 2, 5, 10, 30];
 /// How often a MISSING sidecar bundle is re-checked (access(2), no trap).
 /// Slow enough to stay invisible in the trap log, fast enough that restoring
-/// the bundle takes effect within half a minute.
-const KWS_MISSING_POLL_SECS: u64 = 30;
+/// the bundle after a cold-boot download hot-starts local KWS within seconds.
+const KWS_MISSING_POLL_SECS: u64 = 5;
 const HEALTHY_SECS: u64 = 60;
 
 /// Grace period between a deploy's SIGTERM and the SIGKILL escalation:
@@ -172,6 +172,10 @@ pub enum KwsLifecycleEvent {
         error_code: &'static str,
         detail: String,
     },
+    /// Sidecar is currently not running (missing bundle or exited unexpectedly).
+    /// Allows `VendorMonitor` to permit Core ASR wake fallback without killing
+    /// or restarting `hm-gateway`.
+    Unavailable,
 }
 
 pub type KwsLifecycleSink = Arc<dyn Fn(KwsLifecycleEvent) + Send + Sync>;
@@ -499,7 +503,44 @@ pub fn spawn(
     level: Option<LevelSource>,
     retreat: Option<RetreatSink>,
 ) -> KwsFeed {
-    spawn_with_admission(dir, cpu, device, north, guard, level, retreat, None, None)
+    spawn_with_admission(
+        dir, cpu, device, north, guard, level, retreat, None, None, None,
+    )
+}
+
+/// Reconcile volatile tmpfs `kw.bundle.json` metadata with the current status
+/// and the flash-persisted `config_journal.json` floor so `bundle_generation`
+/// never regresses below the last persisted KWS generation across reboots or
+/// tmpfs wipes.
+fn reconcile_bundle_meta(
+    current_id: &str,
+    current_gen: u64,
+    file_meta: Option<(String, u64)>,
+    bundle_floor: Option<&(Option<String>, u64)>,
+) -> (String, u64) {
+    let (floor_id, floor_gen) = bundle_floor
+        .map(|(id, g)| (id.as_deref(), *g))
+        .unwrap_or((None, 0));
+    let min_gen = current_gen.max(floor_gen);
+    match file_meta {
+        Some((fid, fgen)) if fgen >= min_gen => (fid, fgen),
+        Some((fid, _)) => {
+            let id = if !current_id.is_empty() {
+                current_id.to_string()
+            } else {
+                floor_id.map(ToOwned::to_owned).unwrap_or(fid)
+            };
+            (id, min_gen)
+        }
+        None => {
+            let id = if !current_id.is_empty() {
+                current_id.to_string()
+            } else {
+                floor_id.unwrap_or_default().to_string()
+            };
+            (id, min_gen)
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -513,16 +554,15 @@ pub(super) fn spawn_with_admission(
     retreat: Option<RetreatSink>,
     admit: Option<HitAdmission>,
     lifecycle: Option<KwsLifecycleSink>,
+    bundle_floor: Option<(Option<String>, u64)>,
 ) -> KwsFeed {
-    let initial_bundle = load_bundle_meta(&dir);
+    let (init_id, init_gen) =
+        reconcile_bundle_meta("", 0, load_bundle_meta(&dir), bundle_floor.as_ref());
     let status: SharedStatus = Arc::new(Mutex::new(KwsStatus {
         state: "starting".into(),
         epoch_ms: now_ms(),
-        bundle_id: initial_bundle
-            .as_ref()
-            .map(|(id, _)| id.clone())
-            .unwrap_or_default(),
-        bundle_generation: initial_bundle.map(|(_, g)| g).unwrap_or(0),
+        bundle_id: init_id,
+        bundle_generation: init_gen,
         ..Default::default()
     }));
     let tx: Arc<Mutex<Option<SyncSender<Vec<u8>>>>> = Arc::new(Mutex::new(None));
@@ -573,6 +613,7 @@ pub(super) fn spawn_with_admission(
                 reload_gen,
                 wake,
                 vad_state,
+                bundle_floor,
             )
         })
         .expect("spawn kws supervisor");
@@ -625,6 +666,7 @@ fn supervise(
     reload_gen: Arc<AtomicU64>,
     wake: Arc<(Mutex<u64>, std::sync::Condvar)>,
     vad_state: Arc<AtomicU8>,
+    bundle_floor: Option<(Option<String>, u64)>,
 ) {
     let mut attempt = 0usize;
     let mut reported_off = false;
@@ -634,13 +676,15 @@ fn supervise(
         // Missing bundle: report once, then poll cheaply. Never call spawn —
         // it would statx per retry and flood the trap log (R0 finding).
         if !script_ready(&script) {
-            if spawn_gen > 0 {
-                if let Some(lc) = &lifecycle {
+            if let Some(lc) = &lifecycle {
+                if spawn_gen > 0 {
                     lc(KwsLifecycleEvent::Failed {
                         reload_gen: spawn_gen,
                         error_code: "kws_sidecar_unavailable",
                         detail: format!("keyword sidecar not installed: {}", script.display()),
                     });
+                } else {
+                    lc(KwsLifecycleEvent::Unavailable);
                 }
             }
             if !reported_off {
@@ -666,6 +710,21 @@ fn supervise(
         }
         reported_off = false;
         let started = std::time::Instant::now();
+        // Re-read bundle metadata at every spawn so a hot-downloaded KWS
+        // archive (with restored `kw.bundle.json`) picks up its persisted
+        // identity/generation, while never regressing below the flash floor.
+        {
+            let file_meta = load_bundle_meta(&dir);
+            let mut st = status.lock().unwrap();
+            let (id, gen) = reconcile_bundle_meta(
+                &st.bundle_id,
+                st.bundle_generation,
+                file_meta,
+                bundle_floor.as_ref(),
+            );
+            st.bundle_id = id;
+            st.bundle_generation = gen;
+        }
         // M6b: hash the keyword file AT SPAWN. The deploy path renames the
         // new file into place before killing the child, so the bytes hashed
         // here are exactly the bytes the sidecar opens; the `ready` line is
@@ -825,13 +884,15 @@ fn supervise(
             Ok(st) => format!("sidecar exited ({st}) after {ran}s — restarting"),
             Err(e) => format!("wait failed: {e} — restarting"),
         };
-        if !saw_ready.load(Ordering::Acquire) {
-            if let Some(lc) = &lifecycle {
+        if let Some(lc) = &lifecycle {
+            if !saw_ready.load(Ordering::Acquire) {
                 lc(KwsLifecycleEvent::Failed {
                     reload_gen: spawn_gen,
                     error_code: "kws_sidecar_exited",
                     detail: exit_detail.clone(),
                 });
+            } else {
+                lc(KwsLifecycleEvent::Unavailable);
             }
         }
         set_status(&status, "down", exit_detail, true);
