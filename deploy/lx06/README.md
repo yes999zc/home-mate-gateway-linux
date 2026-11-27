@@ -1,6 +1,6 @@
-# LX06 Deployment & Idle Wake Selection (256 MB Full vs 128 MB Thin Gateway)
+# LX06 Deployment & Idle Wake Selection (256 MB Full vs 128 MB Thin Gateway & Standalone Pure-ASR)
 
-Xiaomi AI Speaker Pro (`LX06`) shipped in **two RAM hardware batches**: **256 MB** (`MemTotal ≈ 241 MiB`, `/tmp ≈ 120 MiB`) and **128 MB** (`MemTotal ≈ 118,760 kB`, `/tmp ≈ 59 MiB`). Check `grep ^MemTotal /proc/meminfo` over SSH before choosing a packaging mode. Both modes use non-invasive **Storage Scheme A** (`/data/hm` -> `/tmp/hm`) and never touch stock `mtd4` / `mtd5` SquashFS partitions.
+Xiaomi AI Speaker Pro (`LX06`) shipped in **two RAM hardware batches**: **256 MB** (`MemTotal ≈ 241 MiB`, `/tmp ≈ 120 MiB`) and **128 MB** (`MemTotal ≈ 118,760 kB`, `/tmp ≈ 59 MiB`). Check `grep ^MemTotal /proc/meminfo` over SSH before choosing a packaging mode. All three modes use non-invasive **Storage Scheme A** (`/data/hm` -> `/tmp/hm`) and never touch stock `mtd4` / `mtd5` SquashFS partitions.
 
 ## Mode 1: 256 MB RAM Full On-Device Dual Wake (`lx06-256m`)
 
@@ -26,7 +26,11 @@ After boot, verify `devices[].mic.vad.endpoint.kind` is `gateway_vad` through `/
 
 > **Community credit**: Thanks to **@jiantongzh** for validating the 128 MB LX06 batch (`MemTotal ≈ 118,760 kB`, `/tmp tmpfs ≈ 59 MB`) and contributing the initial Thin Mode design.
 
-`deploy/lx06/init.sh` automatically enters **Thin Mode** when `HM_THIN_MODE=1`, `/data/hm/thin-mode` exists, **or** `/proc/meminfo` reports `MemTotal < 180000` kB (~180 MB).
+`deploy/lx06/init.sh` enforces a strict 4-tier mode precedence:
+1. **Explicit Thin Mode**: `HM_THIN_MODE=1` or `/data/hm/thin-mode` exists -> always Thin Mode.
+2. **Explicit Standalone Pure-ASR Mode**: `HM_STANDALONE_ASR=1` or `/data/hm/standalone-asr` exists -> overrides `< 180000` kB auto-thin and runs Mode 3 below.
+3. **Auto Thin Mode**: `/proc/meminfo` reports `MemTotal < 180000` kB (~180 MB) without explicit standalone opt-in -> safe default Thin Mode.
+4. **256 MB Full On-Device Dual Wake**: `MemTotal >= 180000` kB without explicit thin/standalone flags.
 
 ### Prerequisite: Full Docker `hm-core` on a LAN NAS / Server
 
@@ -46,21 +50,39 @@ Pack the dedicated gateway-only archive (`hm-lx06-thin.tar.xz`, hard-capped `<= 
 ```
 
 Configuration files under `/data/hm` in Thin Mode:
-- `/data/hm/thin-mode`: forces Thin Mode explicitly (also auto-detected when `MemTotal < 180000` kB).
+- `/data/hm/thin-mode`: forces Thin Mode explicitly (takes precedence over `/data/hm/standalone-asr` and auto-detection).
 - `/data/hm/core.addr`: optional `<LAN_CORE_IP>:8932` (e.g. `192.168.1.50:8932`). When non-loopback, `init.sh` passes `--allow-lan-core` to `hm-gateway` (strictly limited to loopback + RFC 1918 + Tailscale `100.64/10` + IPv6 ULA `fc00::/7`; public internet IPs are always rejected). When absent, defaults to `127.0.0.1:8932` for an SSH reverse tunnel.
 - `/data/hm/core.token`: optional Core bearer token (`chmod 600`), passed via `HM_CORE_AUTH_TOKEN` environment variable into `Hello.auth_token` (never exposed in `/proc/<pid>/cmdline`). Omit for RFC 1918 / Tailscale IPv4 when `lan_gateway_exempt` is enabled in the Core Web Console; **required** for IPv6 ULA (`fc00::/7`) connections.
-- If a full `hm-bundle.tar.xz` is placed on a 128 MB unit instead of `hm-lx06-thin.tar.xz`, `init.sh` automatically removes `hm-core`, `web/`, and `silero_vad.onnx` immediately after unpacking.
+- If a full `hm-bundle.tar.xz` is placed on a 128 MB unit in Thin Mode instead of `hm-lx06-thin.tar.xz`, `init.sh` extracts only `hm-gateway` (never unpacking `hm-core`, `web/`, or `silero_vad.onnx` into 59 MiB `/tmp`).
 
 ### Known Trade-offs of Thin Mode
 
 1. Depends on the LAN NAS/server and LAN/Wi-Fi stability (cannot operate autonomously when the host is offline).
-2. Local `hm-kws` is disabled to save ~27 MiB `/tmp` tmpfs and ~25 MiB RAM; wake runs via Core server-side ASR wake (`proactive_asr_wake`), adding slight wake latency plus continuous LAN PCM uplink traffic and host CPU/VAD/ASR load.
+2. Local `hm-kws` is disabled to save ~50–68 MiB RAM/tmpfs; wake runs via Core server-side ASR wake (`proactive_asr_wake`), adding slight wake latency plus continuous LAN PCM uplink traffic and host CPU/VAD/ASR load.
 3. In dual-wake coexistence with stock XiaoAi, local KWS cannot preempt stock `mipns-xiaomi` at the speaker edge.
 4. Audio and control traverse the LAN (direct `:8932` or SSH tunnel); Wi-Fi jitter can affect interrupt/stop responsiveness.
 
+## Mode 3: 128 MB RAM Standalone Pure-ASR (`--standalone-asr`, No NAS Required)
+
+For 128 MB LX06 owners without a LAN NAS/server, Standalone Pure-ASR skips local `hm-kws` (~50–68 MiB savings) and runs `hm-core --slim` + `hm-gateway` + `:8930` Web Console directly on the speaker (~26–31 MiB net RAM, leaving ~22–30 MiB free headroom):
+
+```sh
+# Download prebuilt v0.0.54+ hm-bundle.tar.xz, hm-bundle.sha256, init.sh, unxz into build/lx06/
+# (or build locally via `./tools/pack_lx06_bundle.sh --standalone-asr`), then install:
+./deploy/lx06/install-lx06.sh \
+  --standalone-asr \
+  --device-ip 192.168.1.10 \
+  --device-id lx06-standalone
+```
+
+Behavior & trade-offs in Standalone Pure-ASR mode:
+- `/data/hm/standalone-asr` (or `HM_STANDALONE_ASR=1`) overrides `< 180000` kB auto-thin (while explicit `/data/hm/thin-mode` / `HM_THIN_MODE=1` still wins).
+- `init.sh` launches `hm-core` with **`HM_VOICE_EVENTS=0`** (preventing `/tmp/hm-voice-events` from filling the 58 MiB `/tmp` tmpfs) and omits `HM_SILERO_VAD` / `KWS_VAD_MODEL` / `--kws` / `fetch_kws_if_needed`.
+- `hm-core --slim` automatically falls back to **energy VAD + cloud `proactive_asr_wake`**: louder background TV/noise can trigger extra cloud ASR calls, wake latency is ~0.5–1.5 s slower than local KWS, and mid-music voice barge-in is weak (control playback via button, Web console, or Android app).
+
 ## Verification & Device Acceptance
 
-Run host-side supervisor tests covering both 256 MB full mode and 128 MB thin mode (cold boot, cache reuse, thin bundle, full-bundle stripping, `core.addr`/`core.token`, and `< 180000 kB` auto-detection):
+Run host-side supervisor tests covering 256 MB full mode, 128 MB thin mode, and 128 MB standalone pure-ASR mode (cold boot, cache reuse, mode precedence, `HM_VOICE_EVENTS=0`, thin bundle, full-bundle stripping, `core.addr`/`core.token`, `< 180000 kB` auto-detection, and `install-lx06.sh` CLI conflict checks):
 
 ```sh
 sh -n deploy/lx06/init.sh && sh -n deploy/lx06/install-lx06.sh && bash -n tools/pack_lx06_bundle.sh

@@ -28,9 +28,15 @@ kws_sync_fail_streak=0
 kws_sync_cooldown=0
 
 # 128 MB RAM LX06 batch (MemTotal ~118,760 kB, /tmp tmpfs ~59 MB) cannot host
-# on-device hm-core + hm-kws without OOM. Auto-enable gateway-only thin mode
-# when RAM < 180 MB, or when explicitly forced via HM_THIN_MODE=1 or
-# /data/hm/thin-mode. 256 MB units stay on full on-device hm-core --slim + KWS.
+# on-device hm-core + hm-kws without OOM.
+# Mode precedence:
+#   1. Explicit Thin Mode (HM_THIN_MODE=1 or /data/hm/thin-mode): gateway-only
+#      thin client dialing a LAN Full Docker hm-core (recommended for 128 MB + NAS).
+#   2. Explicit Standalone Pure-ASR Mode (HM_STANDALONE_ASR=1 or /data/hm/standalone-asr):
+#      on-device hm-core --slim (HM_VOICE_EVENTS=0, energy VAD + cloud ASR wake) +
+#      hm-gateway without local hm-kws (~26-31 MiB RAM, no NAS required).
+#   3. Auto Thin Mode when MemTotal < 180,000 kB (safe default for 128 MB units).
+#   4. 256 MB full on-device hm-core --slim + hm-gateway + local hm-kws dual-wake.
 read_mem_total_kb() {
     [ -r "$MEMINFO_FILE" ] || return 1
     while IFS= read -r line; do
@@ -54,9 +60,19 @@ read_mem_total_kb() {
     return 1
 }
 
+is_standalone_asr_mode() {
+    if [ "${HM_THIN_MODE:-0}" = 1 ] || [ -f "$HM_FLASH_DIR/thin-mode" ]; then
+        return 1
+    fi
+    [ "${HM_STANDALONE_ASR:-0}" = 1 ] || [ -f "$HM_FLASH_DIR/standalone-asr" ]
+}
+
 is_thin_mode() {
     if [ "${HM_THIN_MODE:-0}" = 1 ] || [ -f "$HM_FLASH_DIR/thin-mode" ]; then
         return 0
+    fi
+    if is_standalone_asr_mode; then
+        return 1
     fi
     mem_kb=$(read_mem_total_kb) || return 1
     [ "$mem_kb" -lt "$HM_THIN_MEM_KB" ]
@@ -212,7 +228,7 @@ unpack_bundle_if_needed() {
     # The live directory is a disposable tmpfs cache, never persistent state.
     rm -rf "$HM_RUN_DIR"
     mv "$stage" "$HM_RUN_DIR" || return 1
-    if [ "$thin" = 0 ] && [ -s "$HM_RUN_DIR/silero_vad.onnx" ]; then
+    if [ "$thin" = 0 ] && ! is_standalone_asr_mode && [ -s "$HM_RUN_DIR/silero_vad.onnx" ]; then
         ln -sf "$HM_RUN_DIR/silero_vad.onnx" "$HM_STATE_DIR/models/silero_vad.onnx"
     fi
 }
@@ -455,6 +471,34 @@ supervise_tick() {
                         --volume-cap "$vol_cap" >> "$GW_LOG" 2>&1 &
                     ;;
             esac
+        fi
+        return 0
+    fi
+
+    if is_standalone_asr_mode; then
+        # 128 MB Standalone Pure-ASR mode (no NAS required): run on-device
+        # hm-core --slim (HM_VOICE_EVENTS=0 to protect 58 MB /tmp, energy VAD +
+        # cloud proactive_asr_wake) + hm-gateway over loopback without local hm-kws.
+        if ! pidof hm-core >/dev/null 2>&1; then
+            HM_DATA_DIR="$HM_STATE_DIR" HM_BIND="0.0.0.0:8930" HM_GATEWAY_BIND="127.0.0.1:8932" \
+                HM_WEB_DIR="$HM_RUN_DIR/web" HM_VOICE_EVENTS=0 \
+                HM_LOOP_DIR=/tmp/hm-loop "$HM_RUN_DIR/hm-core" >> "$CORE_LOG" 2>&1 &
+        fi
+        if ! runtime_pid hm-gateway firmware >/dev/null; then
+            dev_id="lx06"
+            if [ -s "$HM_STATE_DIR/device-id" ]; then
+                id_val=$(tr -d '\r\n ' < "$HM_STATE_DIR/device-id")
+                [ -z "$id_val" ] || dev_id="$id_val"
+            fi
+            vol_cap=1.0
+            [ ! -f "$HM_FLASH_DIR/silent" ] || vol_cap=0.0
+            HM_FW_AUDIO_CPU=1 HM_FW_PLAY_CPU=0 HM_LOOP_DIR=/tmp/hm-loop \
+                HM_LX06_DUAL_WAKE=1 \
+                "$HM_RUN_DIR/hm-gateway" firmware --core 127.0.0.1:8932 \
+                --device-id "$dev_id" --model LX06 \
+                --state-dir "$HM_STATE_DIR" --aec --barge-in off \
+                --loudness-bass 0.0 --loopback-probe \
+                --volume-cap "$vol_cap" >> "$GW_LOG" 2>&1 &
         fi
         return 0
     fi

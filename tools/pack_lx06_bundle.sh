@@ -30,21 +30,27 @@ MAX_THIN_BUNDLE_BYTES=$((1536 * 1024))      # 1.5 MiB hard gate for 128 MB thin 
 SKIP_BUILD=0
 SKIP_WEB_BUILD=0
 THIN_MODE=0
+STANDALONE_ASR_MODE=0
 for arg in "$@"; do
     case "$arg" in
         --skip-build) SKIP_BUILD=1 ;;
         --skip-web-build) SKIP_WEB_BUILD=1 ;;
         --thin) THIN_MODE=1 ;;
+        --standalone-asr) STANDALONE_ASR_MODE=1 ;;
         -h|--help)
-            echo "Usage: $0 [--thin] [--skip-build] [--skip-web-build]"
+            echo "Usage: $0 [--thin | --standalone-asr] [--skip-build] [--skip-web-build]"
             exit 0
             ;;
         *)
-            echo "pack_lx06_bundle: unknown option '$arg' (supported: --thin, --skip-build, --skip-web-build)" >&2
+            echo "pack_lx06_bundle: unknown option '$arg' (supported: --thin, --standalone-asr, --skip-build, --skip-web-build)" >&2
             exit 2
             ;;
     esac
 done
+if [[ "$THIN_MODE" -eq 1 && "$STANDALONE_ASR_MODE" -eq 1 ]]; then
+    echo "pack_lx06_bundle: --thin and --standalone-asr are mutually exclusive" >&2
+    exit 2
+fi
 
 GW_BIN="$HERE/target/aarch64-unknown-linux-musl/release/home-mate-device-gateway"
 
@@ -206,7 +212,7 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     echo "=== [2/4] Building LX06 hm-gateway (aarch64-unknown-linux-musl) ==="
     (cd "$HERE" && ./tools/build_firmware_lx06.sh)
 
-    if [[ -d "${SHERPA_PKG:-/private/tmp/sherpa-pkg}" ]]; then
+    if [[ "$STANDALONE_ASR_MODE" -eq 0 && -d "${SHERPA_PKG:-/private/tmp/sherpa-pkg}" ]]; then
         echo "=== [2b/4] Rebuilding aarch64 hm-kws sidecar ==="
         SHERPA_PKG="${SHERPA_PKG:-/private/tmp/sherpa-pkg}" "$HERE/kws/build.sh"
     fi
@@ -217,7 +223,11 @@ WEB_DIST="$CORE_REPO/web/dist"
 KWS_BIN="$HERE/kws/hm-kws"
 KWS_RUN="$HERE/deploy/lx06/kws-run.sh"
 
-for f in "$CORE_BIN" "$GW_BIN" "$VAD_MODEL" "$WEB_DIST/index.html" "$KWS_BIN" "$KWS_RUN"; do
+REQUIRED_INPUTS=("$CORE_BIN" "$GW_BIN" "$VAD_MODEL" "$WEB_DIST/index.html")
+if [[ "$STANDALONE_ASR_MODE" -eq 0 ]]; then
+    REQUIRED_INPUTS+=("$KWS_BIN" "$KWS_RUN")
+fi
+for f in "${REQUIRED_INPUTS[@]}"; do
     if [[ ! -s "$f" ]]; then
         echo "pack_lx06_bundle: required input missing or empty: $f" >&2
         exit 1
@@ -326,9 +336,9 @@ copy_unxz_if_available
 cp "$HERE/deploy/lx06/init.sh" "$OUT_DIR/init.sh"
 chmod 0755 "$OUT_DIR/init.sh"
 
-# Pack hm-kws-lx06.tar.xz if base runtime directory or archive is available
+# Pack hm-kws-lx06.tar.xz if base runtime directory or archive is available (skipped in --standalone-asr mode)
 KWS_BASE_DIR="${KWS_BASE_DIR:-/private/tmp/lx06-bundle/kws-extract}"
-if [[ -d "$KWS_BASE_DIR" && -f "$KWS_BASE_DIR/ld-linux-aarch64.so.1" ]]; then
+if [[ "$STANDALONE_ASR_MODE" -eq 0 && -d "$KWS_BASE_DIR" && -f "$KWS_BASE_DIR/ld-linux-aarch64.so.1" ]]; then
     echo "=== [4/4] Packing KWS sidecar bundle: $OUT_DIR/hm-kws-lx06.tar.xz ==="
     python3 - "$KWS_BASE_DIR" "$KWS_BIN" "$KWS_RUN" "$OUT_DIR" <<'PY'
 import hashlib
@@ -399,6 +409,8 @@ kws_sha = hashlib.sha256(compressed).hexdigest()
 print(f"PASS  hm-kws (aarch64) : {kws_bin.stat().st_size:>10,} B  sha256={hashlib.sha256(kws_bin.read_bytes()).hexdigest()}")
 print(f"PASS  hm-kws-lx06.tar.xz: {len(compressed):>9,} B  sha256={kws_sha}")
 PY
+elif [[ "$STANDALONE_ASR_MODE" -eq 1 ]]; then
+    echo "=== [4/4] Skipping hm-kws-lx06.tar.xz repack (--standalone-asr mode) ==="
 else
     echo "=== [4/4] Skipping hm-kws-lx06.tar.xz repack (KWS_BASE_DIR not found at $KWS_BASE_DIR) ==="
 fi

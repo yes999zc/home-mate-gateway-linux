@@ -314,7 +314,7 @@ start_native_services
             "silero_vad.onnx": b"fixture",
             "web/index.html": b"<html></html>",
         })
-        result = self.run_shell("supervise_tick; wait; supervise_tick; wait")
+        result = self.run_shell("unset HM_SILERO_VAD KWS_VAD_MODEL; supervise_tick; wait; supervise_tick; wait")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / "count").read_text().splitlines(), ["unpack"])
         self.assertTrue((self.root / "hm/hm-gateway").is_file())
@@ -608,6 +608,120 @@ test "$kws_sync_cooldown" -eq 0
 grep -qx 'new-kw-v2' "$HM_STATE_DIR/kws-persist/kw.txt"
 """)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_standalone_asr_mode_overrides_128mb_auto_thin_runs_core_with_voice_events_disabled_and_skips_kws(self):
+        # 128 MB LX06 batch (MemTotal ~118 MB) opting into standalone pure-ASR mode
+        # must override auto-thin, launch on-device hm-core with HM_VOICE_EVENTS=0
+        # (no HM_SILERO_VAD), launch hm-gateway against loopback without --kws or
+        # KWS_VAD_MODEL, and never fetch or unpack hm-kws.
+        self.meminfo.write_text("MemTotal:         118760 kB\nMemFree:           52000 kB\n")
+        (self.flash / "standalone-asr").write_text("")
+        (self.flash / "kws.url").unlink()
+        (self.flash / "kws.sha256").unlink()
+        core_stub = (
+            STUB
+            + b'printf "%s|%s|%s" "${HM_VOICE_EVENTS:-}" "${HM_SILERO_VAD:-}" "${HM_BIND:-}" > "$FIXTURE/core-env"\n'
+        )
+        gw_stub = STUB + b'printf "%s" "${KWS_VAD_MODEL:-}" > "$FIXTURE/gw-vad-env"\n'
+        archive(self.flash / "hm-bundle.tar.xz", {
+            "hm-core": core_stub,
+            "hm-gateway": gw_stub,
+            "silero_vad.onnx": b"fixture",
+            "web/index.html": b"<html></html>",
+        })
+        result = self.run_shell("unset HM_SILERO_VAD KWS_VAD_MODEL; supervise_tick; wait; supervise_tick; wait")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Main bundle unpacked once and cached; KWS archive never touched.
+        self.assertEqual((self.root / "count").read_text().splitlines(), ["unpack"])
+        self.assertTrue((self.root / "hm/hm-core").is_file())
+        self.assertTrue((self.root / "hm/hm-gateway").is_file())
+        self.assertFalse((self.root / "hm-kws").exists())
+        self.assertFalse((self.flash / "state/models/silero_vad.onnx").exists())
+        self.assertEqual((self.root / "core-env").read_text(), "0||0.0.0.0:8930")
+        self.assertEqual((self.root / "gw-vad-env").read_text(), "")
+        starts = (self.root / "starts").read_text().splitlines()
+        core_starts = [s for s in starts if s.startswith("hm-core ")]
+        gw_starts = [s for s in starts if s.startswith("hm-gateway 1 firmware ")]
+        self.assertEqual(len(core_starts), 2)
+        self.assertEqual(len(gw_starts), 2)
+        for line in gw_starts:
+            self.assertIn("--core 127.0.0.1:8932", line)
+            self.assertIn("--model LX06", line)
+            self.assertNotIn("--allow-lan-core", line)
+            self.assertNotIn("--kws", line)
+
+    def test_standalone_asr_mode_explicit_thin_flag_still_takes_precedence(self):
+        self.meminfo.write_text("MemTotal:         118760 kB\nMemFree:           52000 kB\n")
+        (self.flash / "standalone-asr").write_text("")
+        (self.flash / "thin-mode").write_text("")
+        (self.flash / "kws.url").unlink()
+        (self.flash / "kws.sha256").unlink()
+        archive(self.flash / "hm-bundle.tar.xz", {"hm-core": STUB, "hm-gateway": STUB})
+        result = self.run_shell("supervise_tick; wait")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        starts = (self.root / "starts").read_text().splitlines()
+        self.assertFalse(any(s.startswith("hm-core ") for s in starts))
+        self.assertEqual(sum(s.startswith("hm-gateway 1 firmware ") for s in starts), 1)
+        self.assertFalse((self.root / "hm/hm-core").exists())
+
+    def test_standalone_asr_mode_supports_xiaoai_pin_toggle_and_custom_device_id(self):
+        self.meminfo.write_text("MemTotal:         118760 kB\nMemFree:           52000 kB\n")
+        (self.flash / "standalone-asr").write_text("")
+        (self.flash / "kws.url").unlink()
+        (self.flash / "kws.sha256").unlink()
+        state_dir = self.flash / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        (state_dir / "device-id").write_text("lx06-standalone\n")
+        result = self.run_shell("""
+supervise_tick
+wait
+printf 'xiaoai-pinned\\n' > "$HM_FLASH_DIR/mode"
+supervise_tick
+wait
+printf 'homemate\\n' > "$HM_FLASH_DIR/mode"
+supervise_tick
+wait
+""")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "count").read_text().splitlines(), ["unpack"])
+        starts = (self.root / "starts").read_text().splitlines()
+        gw_starts = [s for s in starts if s.startswith("hm-gateway 1 firmware ")]
+        self.assertEqual(len(gw_starts), 2)
+        for line in gw_starts:
+            self.assertIn("--device-id lx06-standalone --model LX06", line)
+            self.assertNotIn("--kws", line)
+        self.assertEqual(sum("lx06-switch-watch" in s for s in starts), 1)
+        services = (self.root / "services").read_text().splitlines()
+        self.assertIn("stop hm-core", services)
+        self.assertIn("stop firmware", services)
+
+    def test_install_lx06_cli_rejects_conflicting_standalone_asr_flags(self):
+        installer = SUPERVISOR.parent / "install-lx06.sh"
+        help_res = subprocess.run(["sh", str(installer), "--help"], text=True, capture_output=True, timeout=10)
+        self.assertEqual(help_res.returncode, 0, help_res.stderr)
+        self.assertIn("--standalone-asr", help_res.stdout)
+
+        both = subprocess.run(
+            ["sh", str(installer), "--thin", "--standalone-asr", "--device-ip", "192.168.1.10"],
+            text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(both.returncode, 2)
+        self.assertIn("mutually exclusive", both.stderr)
+
+        with_core = subprocess.run(
+            ["sh", str(installer), "--standalone-asr", "--device-ip", "192.168.1.10", "--core-addr", "192.168.1.50:8932"],
+            text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(with_core.returncode, 2)
+        self.assertIn("--standalone-asr", with_core.stderr)
+
+        for flag, val in (("--core-token", "tok_test"), ("--kws-url", "http://192.168.1.50:18089/kws.tar.xz")):
+            conflict = subprocess.run(
+                ["sh", str(installer), "--standalone-asr", "--device-ip", "192.168.1.10", flag, val],
+                text=True, capture_output=True, timeout=10,
+            )
+            self.assertEqual(conflict.returncode, 2, f"{flag} must conflict with --standalone-asr")
+            self.assertIn("--standalone-asr", conflict.stderr)
 
 
 if __name__ == "__main__":

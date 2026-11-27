@@ -53,7 +53,8 @@
 | :--- | :--- | :--- | :--- | :--- |
 | **目标 1：Amazon Echo Dot 2 (`dot2`)** | Echo Dot 2 (`AEOBC` / `RS03QR`), 512 MB RAM | `armv7-unknown-linux-musleabihf`<br/>`board-dot2`（默认）+ `clock32` | 本机独立运行：全量 `hm-core` + `hm-gateway` + 本地 `hm-kws`（代码默认 `0.25/3.00`；实机标定基线 `0.32/2.50`），7 麦 + ch8 回环 AEC、12 颗灯环、A/B 槽 OTA | **音箱本机** 全量 `hm-core`，回环 `127.0.0.1:8932` |
 | **目标 2：小米小爱 Pro `LX06` 256 MB (`lx06-256m`)** | `LX06` 256 MB 批次（`MemTotal >= 180,000 kB`，`/tmp` 约 120 MiB） | `aarch64-unknown-linux-musl`<br/>`--no-default-features --features board-lx06` | 本机独立双唤醒：`hm-core --slim` + `hm-gateway` + 本地 `hm-kws`（`0.20/2.50`，`gateway_vad`），方案 A（零改动 SquashFS），与原厂小爱共存 | **音箱本机** `hm-core --slim`，回环 `127.0.0.1:8932` |
-| **目标 3：小米小爱 Pro `LX06` 128 MB 瘦网关 (`lx06-128m`)** | `LX06` 128 MB 批次（`MemTotal < 180,000 kB`，约 118 MB RAM、`/tmp` 约 59 MiB） | `aarch64-unknown-linux-musl`<br/>`--no-default-features --features board-lx06` | 仅网关瘦客户端：`hm-lx06-thin.tar.xz`（压缩 ~550 KB / 解压 ~1.6 MiB），不跑本机 `hm-core` 与 `hm-kws`，零改动 SquashFS | **局域网 NAS / 服务器上的全量 Docker `hm-core`**（直连局域网 `:8932` 或 SSH 反向隧道） |
+| **目标 3A：小米小爱 Pro `LX06` 128 MB 瘦网关（推荐有 NAS）** | `LX06` 128 MB 批次（`MemTotal < 180,000 kB`，约 118 MB RAM、`/tmp` 约 59 MiB） | `aarch64-unknown-linux-musl`<br/>`--no-default-features --features board-lx06` | 仅网关瘦客户端：`hm-lx06-thin.tar.xz`（压缩 ~606 KB / 运行仅 ~4 MiB RAM），不跑本机 `hm-core` 与 `hm-kws`，零改动 SquashFS | **局域网 NAS / 服务器上的全量 Docker `hm-core`**（带 Silero VAD，直连局域网 `:8932` 或 SSH 反向隧道） |
+| **目标 3B：小米小爱 Pro `LX06` 128 MB 无 NAS 单机纯 ASR（尝鲜）** | `LX06` 128 MB 批次（`MemTotal < 180,000 kB`，无 NAS/服务器） | `aarch64-unknown-linux-musl`<br/>`--no-default-features --features board-lx06` | 本机纯 ASR：`hm-core --slim`（`HM_VOICE_EVENTS=0`，能量 VAD + 云端 ASR 唤醒）+ `hm-gateway`，**跳过 `hm-kws`**（净吃 ~26–31 MiB RAM，余量 ~22–30 MiB），零改动 SquashFS | **音箱本机** `hm-core --slim`，回环 `127.0.0.1:8932`（无需 NAS） |
 
 > **关于非 Pro 版小爱音箱**：目前仅内置验证 **LX06（小米小爱音箱 Pro）**；非 Pro 型号可参考文末 [移植新 Linux 音箱指南](#移植新-linux-音箱指南)。
 
@@ -78,74 +79,99 @@
   ```
 - **控制台与切换**：访问 `http://192.168.1.10:8930`；长按音箱顶部「播放/暂停」键 1.5 秒（`lx06-switch-watch`）即可在双唤醒（`homemate`）与原厂小爱独占模式（`xiaoai-pinned`）间自由切换。
 
-### 目标 3：小米小爱音箱 Pro `LX06` 128 MB 瘦网关 (`lx06-128m`)
+### 目标 3：小米小爱音箱 Pro `LX06` 128 MB 批次（双方案可选：有 NAS 瘦网关 / 无 NAS 单机纯 ASR）
 
 > **社区致谢**：特别感谢 **[@jiantongzh](https://github.com/jiantongzh)** 实机验证 128 MB 批次 LX06 规格并贡献最初的 Thin Mode 瘦网关设计！
+> **免编译直装**：`v0.0.54` 起 GitHub Releases 已同时挂载预编译成品包（`hm-lx06-thin.tar.xz` 约 `606 KB`、`hm-bundle.tar.xz` 约 `5.0 MiB`、`init.sh`、`unxz` 与 `SHA256SUMS.txt`），**无需安装 Rust 交叉编译工具链即可直接下载安装**。
 
-#### 必要前提：局域网 NAS / 服务器运行「全量 Docker `hm-core`」
-128 MB 瘦网关**必须搭配一台局域网常开 NAS / 服务器 / Mac / 迷你主机**运行 [`yes999zc/home-mate`](https://github.com/yes999zc/home-mate) 的**标准全量版 Docker `hm-core`**（切勿使用 `--slim`，全量版支持服务器侧内嵌 Silero VAD）：
-
-```bash
-git clone https://github.com/yes999zc/home-mate.git
-cd home-mate
-docker compose up -d
-```
-首次访问 `http://<NAS_IP>:8930` **务必立即配对管理员令牌**（`HM_GATEWAY_ALLOW_LAN=1`），安装瘦网关时通过 `--core-token` 传入（以 `chmod 600` 存入 `/data/hm/core.token` 并通过环境变量注入，绝不出现在命令行进程参数中），或按需开启局域网免密豁免 `lan_gateway_exempt`。
-
-#### 瘦网关模式的架构取舍（如实告知）
-1. **依赖局域网 NAS/服务器与 Wi-Fi 稳定性**（服务器断线时无法独立工作）。
-2. **无音箱本机 KWS 侧车**（节省约 27 MiB `/tmp` 与 25 MiB RAM），改由局域网 Core 通过服务器侧 ASR 唤醒（`proactive_asr_wake`）。
-3. **双唤醒共存时无法在音箱端侧抢占原厂小爱**。
-4. **音频与控制信令经局域网传输**，Wi-Fi 抖动会影响打断/停止响应速度。
-
-#### 自动识别与一键安装
-`deploy/lx06/init.sh` 在 `MemTotal < 180000` kB（或存在 `/data/hm/thin-mode` / `HM_THIN_MODE=1`）时自动进入瘦模式，仅解压 `hm-gateway`：
+#### 方案 3A（推荐，家里有 NAS / 电脑 / 软路由）：128 MB 瘦网关 (`--thin`) + NAS 全量 Docker `hm-core`
+音箱端只跑 `hm-gateway`（仅吃 `~4 MiB` RAM，富裕 `~50 MiB`），由局域网 NAS/服务器上的**标准全量版 Docker `hm-core`**（内置 Silero 神经网络 VAD，切勿使用 `--slim`）处理对话与语音：
 
 ```bash
-# 1. 打包专用瘦网关包（<= 1.5 MiB，仅含 hm-gateway，无需拉取 hm-core 仓库）
-./tools/pack_lx06_bundle.sh --thin
+# 1. 在 NAS / 服务器部署标准全量版 Docker hm-core（开启 HM_GATEWAY_ALLOW_LAN=1，并在 :8930 配对令牌）
+git clone https://github.com/yes999zc/home-mate.git && cd home-mate && docker compose up -d
 
-# 2. 一键安装到 128 MB LX06 并直连局域网全量 Docker hm-core
+# 2. 免编译下载 v0.0.54 瘦网关成品包并安装到 128 MB LX06（也可运行 ./tools/pack_lx06_bundle.sh --thin 自行编译）
+git clone https://github.com/yes999zc/home-mate-gateway-linux.git && cd home-mate-gateway-linux
+mkdir -p build/lx06
+for f in hm-lx06-thin.tar.xz hm-lx06-thin.sha256 init.sh unxz SHA256SUMS.txt; do
+  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.54/$f" -o "build/lx06/$f"
+done
+chmod +x build/lx06/init.sh build/lx06/unxz
 ./deploy/lx06/install-lx06.sh \
   --thin \
   --device-ip 192.168.1.10 \
   --core-addr 192.168.1.50:8932 \
-  --device-id lx06-livingroom
-# （开启强鉴权时追加 --core-token "<你的令牌>"；省略 --core-addr 则走 SSH 反向隧道 127.0.0.1:8932）
+  --device-id lx06-livingroom \
+  --core-token "<NAS控制台配对令牌>"
 ```
-*（`--allow-lan-core` 仍严格仅放行回环 + RFC 1918 私网 + Tailscale `100.64/10` + IPv6 ULA `fc00::/7`，**永远拒绝公网 IP**。）*
+*（`--allow-lan-core` 仍严格仅放行回环 + RFC 1918 私网 + Tailscale `100.64/10` + IPv6 ULA `fc00::/7`，**永远拒绝公网 IP**；`--core-token` 以 `chmod 600` 存入 `/data/hm/core.token` 并通过环境变量注入。省略 `--core-addr` 则走 SSH 反向隧道 `127.0.0.1:8932`。）*
+
+#### 方案 3B（无 NAS 单机尝鲜）：128 MB 本机纯 ASR 模式 (`--standalone-asr`)
+如果手里**没有 NAS / 常开服务器**，128 MB LX06 也可以直接跳过吃掉 `50~68 MiB` 内存的本地 `hm-kws`，在本机独立运行 **`hm-core --slim`（自动禁用 `/tmp/hm-voice-events` 防撑爆 58 MB `/tmp`）+ `hm-gateway` + `:8930` 控制台**（合计净吃 `~26–31 MiB` RAM，保留 `~22–30 MiB` 安全余量，`/data` 需 ≥ `5.5 MiB` 空闲）：
+
+```bash
+# 1. 免编译下载 v0.0.54 主包（也可运行 ./tools/pack_lx06_bundle.sh --standalone-asr 自行编译）
+git clone https://github.com/yes999zc/home-mate-gateway-linux.git && cd home-mate-gateway-linux
+mkdir -p build/lx06
+for f in hm-bundle.tar.xz hm-bundle.sha256 init.sh unxz SHA256SUMS.txt; do
+  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.54/$f" -o "build/lx06/$f"
+done
+chmod +x build/lx06/init.sh build/lx06/unxz
+
+# 2. 一键安装到 128 MB LX06（零 NAS 依赖，安装完直接访问 http://192.168.1.10:8930）
+./deploy/lx06/install-lx06.sh \
+  --standalone-asr \
+  --device-ip 192.168.1.10 \
+  --device-id lx06-standalone
+```
+
+#### 128 MB 两种模式的架构取舍（如实告知）
+1. **方案 3A（瘦网关 + NAS）**：依赖局域网 NAS 与 Wi-Fi，无音箱端本地 KWS，但 NAS 侧拥有完整 **Silero 神经网络 VAD**（抗环境噪音准、不乱费 ASR 额度），且音箱内存最宽裕（剩 ~50 MiB）。
+2. **方案 3B（无 NAS 单机纯 ASR）**：完全不依赖 NAS、开箱即用 `:8930` 控制台；但因关闭了 `hm-kws` 且 `--slim` 自动回退到**能量 VAD + 云端 ASR 唤醒**，存在以下取舍：① 电视/环境较吵时能量 VAD 容易误送背景音去云端 ASR；② 唤醒比本地 KWS 慢约 `0.5~1.5 秒`；③ 无本地热词打断/本地退出词，放歌期间语音打断较弱（可通过物理按键、控制台或手机 App 控播）。
+3. **默认自动分流**：`deploy/lx06/init.sh` 在 `MemTotal < 180000` kB 时默认自动进入安全的瘦模式（3A）；仅当显式写入 `/data/hm/standalone-asr`（由 `--standalone-asr` 安装）或 `HM_STANDALONE_ASR=1` 时启用单机纯 ASR 模式（3B）。
 
 ---
 
 ## AI 编程助手一键部署提示词
 
-### 提示词 A：小米小爱音箱 Pro (`LX06`) 智能自适应部署（自动判断 256 MB / 128 MB）
+### 提示词 A：小米小爱音箱 Pro (`LX06`) 智能自适应部署（256 MB / 128 MB 三模式自动分流）
 ```text
-请帮我把 Home Mate 部署到我的小米小爱音箱 Pro（LX06），音箱局域网 IP 是 192.168.1.10（已通过 open-xiaoai 开启 root SSH），我的局域网 NAS/服务器 IP 是 192.168.1.50。
+请帮我把 Home Mate 部署到我的小米小爱音箱 Pro（LX06），音箱局域网 IP 是 192.168.1.10（已通过 open-xiaoai 开启 root SSH）；如果我有局域网 NAS/服务器，IP 是 192.168.1.50（若没有 NAS，请告知我改走 128 MB 无 NAS 单机纯 ASR 模式）。
 
 请严格遵守以下安全与架构规则：
 1. 严禁修改原厂 SquashFS 分区（mtd4 / mtd5），仅允许使用零变砖的方案 A（只写 /data/hm 与 /data/init.sh）。
 2. 第一步必须先 SSH 登录 root@192.168.1.10，执行 `free -m`、`grep ^MemTotal /proc/meminfo` 和 `df -h /data /tmp`，根据实测内存自动分流：
    - 若 MemTotal >= 180000 kB（256 MB 批次 -> 目标 2 本机独立双唤醒）：
-     a) 确认 /data 剩余 >= 6 MiB，执行 `./tools/pack_lx06_bundle.sh` 打包（<= 6.0 MiB），并在局域网 HTTP 托管 `build/lx06/hm-kws-lx06.tar.xz`。
+     a) 确认 /data 剩余 >= 6 MiB，执行 `./tools/pack_lx06_bundle.sh` 打包（或下载 Release 成品包），并在局域网 HTTP 托管 `build/lx06/hm-kws-lx06.tar.xz`。
      b) 执行 `./deploy/lx06/install-lx06.sh --device-ip 192.168.1.10 --kws-url http://192.168.1.50:18089/hm-kws-lx06.tar.xz` 安装。
      c) 验证音箱上 `hm-core`、`hm-gateway`、`hm-kws` 均在线，`http://192.168.1.10:8930` 返回 200，且 `/api/v0/mode` 显示 LX06 灵敏度 `0.20 / 2.50`。
-   - 若 MemTotal < 180000 kB（128 MB 批次 -> 目标 3 瘦网关模式）：
-     a) 先在我的 NAS/服务器（192.168.1.50）检查或部署 `https://github.com/yes999zc/home-mate` 的**标准全量版（FULL）Docker `hm-core`**（`docker compose up -d`，开启 `HM_GATEWAY_ALLOW_LAN=1` 并配对管理员令牌）。切勿在 NAS 上使用 `--slim`！
-     b) 在 `home-mate-gateway-linux` 执行 `./tools/pack_lx06_bundle.sh --thin` 打包专用瘦网关包（<= 1.5 MiB）。
-     c) 执行 `./deploy/lx06/install-lx06.sh --thin --device-ip 192.168.1.10 --core-addr 192.168.1.50:8932` 安装（未开免密时附加 `--core-token`）。
-     d) 验证音箱上**只运行 `hm-gateway`**、`/tmp/hm-gateway.log` 与 `192.168.1.50:8932` 握手成功，且音箱在 `http://192.168.1.50:8930` 控制台显示在线。
+   - 若 MemTotal < 180000 kB（128 MB 批次）：
+     * 【优先·有 NAS -> 方案 3A 瘦网关模式】：
+       a) 先在 NAS/服务器（192.168.1.50）部署 `yes999zc/home-mate` 标准全量版（FULL）Docker `hm-core`（切勿用 `--slim`，开启 `HM_GATEWAY_ALLOW_LAN=1` 并配对管理员令牌）。
+       b) 从 `yes999zc/home-mate-gateway-linux` 最新 Release（v0.0.54+）直接下载 `hm-lx06-thin.tar.xz`、`hm-lx06-thin.sha256`、`init.sh`、`unxz` 到 `build/lx06/`（无需 Rust 编译），执行 `./deploy/lx06/install-lx06.sh --thin --device-ip 192.168.1.10 --core-addr 192.168.1.50:8932 --core-token "<令牌>"`。
+       c) 验证音箱只运行 `hm-gateway` 且在 `http://192.168.1.50:8930` 显示在线。
+     * 【无 NAS 尝鲜 -> 方案 3B 本机纯 ASR 模式】：
+       a) 确认 `/data` 剩余 >= 5.5 MiB，从最新 Release（v0.0.54+）下载 `hm-bundle.tar.xz`、`hm-bundle.sha256`、`init.sh`、`unxz` 到 `build/lx06/`（免编译），执行 `./deploy/lx06/install-lx06.sh --standalone-asr --device-ip 192.168.1.10`。
+       b) 验证音箱只运行 `hm-core`（含 `HM_VOICE_EVENTS=0`）与 `hm-gateway`（无 `hm-kws`）、`/tmp` 占用 < 45%、且 `http://192.168.1.10:8930` 返回 200。
 3. 严禁把任何真实 IP、Token 或密钥写入 Git；操作 NAS 重启或已有服务前请先征求我的确认。
 ```
 
-### 提示词 B：已知 128 MB 批次 `LX06`（NAS 全量 Docker Core + 瘦网关联动）
+### 提示词 B：已知 128 MB 批次 `LX06`（免编译直装：有 NAS 瘦网关 / 无 NAS 单机纯 ASR）
 ```text
-我确认我的小米小爱音箱 Pro（LX06，IP 192.168.1.10）是 128 MB 内存批次（MemTotal 约 118 MB，/tmp 约 59 MB）。请帮我按「目标 3：128 MB 瘦网关 + 局域网 NAS 全量 Docker hm-core（192.168.1.50）」完成部署：
+我确认我的小米小爱音箱 Pro（LX06，IP 192.168.1.10）是 128 MB 内存批次（MemTotal 约 118 MB，/tmp 约 59 MB）。请直接下载 `yes999zc/home-mate-gateway-linux` 最新 Release（v0.0.54+）预编译包（无需本地编译 Rust），按我手头环境二选一完成部署（绝不触碰原厂 SquashFS `mtd4`/`mtd5`）：
 
-1. 在 NAS（192.168.1.50）部署 `yes999zc/home-mate` 的**标准全量版 `hm-core`**（`docker compose up -d`，不要用 `--slim`，开放 8930/8932/8933-udp）并立即配对管理员令牌。
-2. 在 `yes999zc/home-mate-gateway-linux` 执行 `./tools/pack_lx06_bundle.sh --thin` 生成 `build/lx06/hm-lx06-thin.tar.xz`（<= 1.5 MiB）。
-3. 执行 `./deploy/lx06/install-lx06.sh --thin --device-ip 192.168.1.10 --core-addr 192.168.1.50:8932 --device-id lx06-room1 --core-token "<令牌>"`（绝不触碰原厂 SquashFS `mtd4`/`mtd5`）。
-4. 验证 `/tmp/hm-gateway.log` 北向 v2 握手成功、`/tmp` 占用远低于 50%，并在 `http://192.168.1.50:8930` 看到音箱在线。
+- 选项 1（我有 NAS/电脑，IP 192.168.1.50，推荐）：
+  1. 在 NAS 部署 `yes999zc/home-mate` 标准全量版 Docker `hm-core`（不要用 `--slim`，开启 `HM_GATEWAY_ALLOW_LAN=1`，开放 8930/8932/8933-udp）并立即配对管理员令牌。
+  2. 下载 `hm-lx06-thin.tar.xz`、`hm-lx06-thin.sha256`、`init.sh`、`unxz` 到 `build/lx06/` 并校验 SHA-256。
+  3. 执行 `./deploy/lx06/install-lx06.sh --thin --device-ip 192.168.1.10 --core-addr 192.168.1.50:8932 --device-id lx06-room1 --core-token "<令牌>"`。
+  4. 验证 `/tmp/hm-gateway.log` 握手成功且音箱出现在 `http://192.168.1.50:8930`。
+
+- 选项 2（我没有 NAS，想先在 128 MB 音箱上单机纯 ASR 尝鲜）：
+  1. 确认音箱 `/data` 剩余空间 >= 5.5 MiB。
+  2. 下载 `hm-bundle.tar.xz`、`hm-bundle.sha256`、`init.sh`、`unxz` 到 `build/lx06/` 并校验 SHA-256。
+  3. 执行 `./deploy/lx06/install-lx06.sh --standalone-asr --device-ip 192.168.1.10 --device-id lx06-standalone`。
+  4. 验证音箱仅运行 `hm-core`（`HM_VOICE_EVENTS=0`）和 `hm-gateway`（不运行 `hm-kws`），`http://192.168.1.10:8930` 返回 200，并提醒我该模式使用能量 VAD + 云端 ASR 唤醒。
 ```
 
 ### 提示词 C：Amazon Echo Dot 2 (`dot2`) 编译与本地验证
@@ -184,7 +210,8 @@ cargo test --workspace --all-features --all-targets --locked -- --test-threads=1
 ./tools/build_firmware.sh          # 目标 1：Echo Dot 2 (armv7 + 16 MiB 门禁)
 ./tools/build_firmware_lx06.sh     # 目标 2/3：LX06 网关二进制 (aarch64)
 ./tools/pack_lx06_bundle.sh        # 目标 2：LX06 256 MB 方案 A 完整包 (<= 6.0 MiB)
-./tools/pack_lx06_bundle.sh --thin # 目标 3：LX06 128 MB 瘦网关包 (<= 1.5 MiB)
+./tools/pack_lx06_bundle.sh --thin           # 目标 3A：LX06 128 MB 瘦网关包 (<= 1.5 MiB)
+./tools/pack_lx06_bundle.sh --standalone-asr # 目标 3B：LX06 128 MB 无 NAS 单机纯 ASR 包 (<= 6.0 MiB)
 ```
 
 ---
