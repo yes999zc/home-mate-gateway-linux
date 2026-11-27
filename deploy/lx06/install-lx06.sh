@@ -228,7 +228,7 @@ ps | grep -E "hm-core|hm-gateway|hm-kws" | grep -v grep || true
     if [ -z "$CORE_ADDR" ]; then
         echo "  Note        : No --core-addr set; cleared /data/hm/core.addr so gateway defaults to 127.0.0.1:8932 (SSH reverse tunnel)."
     fi
-    echo "  10-Min Beginner Guide: https://mymate.homes/#guideline"
+    echo "  10-Min Beginner Guide: https://mymate.homes/#quickstart"
     exit 0
 fi
 
@@ -286,7 +286,7 @@ ps | grep -E "hm-core|hm-gateway|hm-kws" | grep -v grep || true
     echo "  Web Console : http://$DEVICE_IP:8930  (runs directly on the speaker, no NAS required)"
     echo "  Mode Notes  : Local hm-kws is disabled (saves ~50-68 MiB RAM); wake runs via energy VAD + cloud ASR."
     echo "                Voice event journaling is disabled (HM_VOICE_EVENTS=0) to protect 58 MB /tmp."
-    echo "  10-Min Beginner Guide: https://mymate.homes/#guideline"
+    echo "  10-Min Beginner Guide: https://mymate.homes/#quickstart"
     exit 0
 fi
 
@@ -342,4 +342,4 @@ ps | grep -E "hm-core|hm-gateway|hm-kws" | grep -v grep || true
 echo ""
 echo "✓ Home Mate LX06 deployment complete!"
 echo "  Web Console: http://$DEVICE_IP:8930"
-echo "  10-Min Beginner Guide: https://mymate.homes/#guideline"
+echo "  10-Min Beginner Guide: https://mymate.homes/#quickstart"

@@ -108,6 +108,7 @@ mkdir -p build/lx06
 for f in hm-lx06-thin.tar.xz hm-lx06-thin.sha256 init.sh unxz SHA256SUMS.txt; do
   curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.54/$f" -o "build/lx06/$f"
 done
+(cd build/lx06 && grep -E 'hm-lx06-thin|init\.sh|unxz' SHA256SUMS.txt | shasum -a 256 -c -)
 chmod +x build/lx06/init.sh build/lx06/unxz
 ./deploy/lx06/install-lx06.sh \
   --thin \
@@ -128,6 +129,7 @@ mkdir -p build/lx06
 for f in hm-bundle.tar.xz hm-bundle.sha256 init.sh unxz SHA256SUMS.txt; do
   curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.54/$f" -o "build/lx06/$f"
 done
+(cd build/lx06 && grep -E 'hm-bundle|init\.sh|unxz' SHA256SUMS.txt | shasum -a 256 -c -)
 chmod +x build/lx06/init.sh build/lx06/unxz
 
 # 2. Install onto 128 MB LX06 (zero NAS required; open http://192.168.1.10:8930 when done)
