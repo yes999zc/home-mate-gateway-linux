@@ -3,7 +3,7 @@
 #
 # Uses zig cc for C dependencies (vendored SpeexDSP) and rust-lld for the
 # final link so Rust's own musl libc.a (mallocng) is linked instead of Zig's
-# SmpAllocator (see tools/build_firmware.sh and home-mate-b/tools/build_core.sh).
+# SmpAllocator (see tools/build_firmware.sh and home-mate/tools/build_core.sh).
 set -eu
 
 TARGET=aarch64-unknown-linux-musl

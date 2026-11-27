@@ -53,7 +53,7 @@ def main() -> int:
         return 1
 
     payload = json.dumps({
-        "user": {"uid": "home-mate-b-erle-stimulus"},
+        "user": {"uid": "home-mate-erle-stimulus"},
         "req_params": {
             "text": TEXT,
             "speaker": VOICE,

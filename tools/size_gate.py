@@ -8,7 +8,7 @@ body. An artifact that links and passes every ELF assertion but exceeds that
 number is simply unshippable — the device rejects the update, so the build
 result is worthless no matter how green everything else is. Both repositories
 produce such an artifact (hm-core here, the gateway firmware image in
-home-mate-device-gateway-b) and both run close to the line, which is why the
+home-mate-gateway-linux) and both run close to the line, which is why the
 number is checked on every release build instead of being rediscovered at
 deploy time.
 

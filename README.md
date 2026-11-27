@@ -248,6 +248,6 @@ cargo test --workspace --all-features --all-targets --locked -- --test-threads=1
 
 Aligned with [`yes999zc/home-mate`](https://github.com/yes999zc/home-mate):
 - **Open Source**: **GNU Affero General Public License v3.0 (`AGPL-3.0-only`)** ([`LICENSE`](LICENSE)).
-- **Northbound v2 Protocol Exception**: **Apache License 2.0** ([`LICENSE-PROTOCOL-APACHE-2.0`](LICENSE-PROTOCOL-APACHE-2.0)).
+- **Northbound v2 Protocol Exception**: **Apache License 2.0** ([`LICENSE-PROTOCOL-APACHE-2.0`](LICENSE-PROTOCOL-APACHE-2.0); see [`LICENSING.md`](LICENSING.md)).
 - **Commercial / OEM Licensing**: Contact `zhangcong1985@gmail.com` / `yes999zc@163.com` ([https://mymate.homes](https://mymate.homes)).
 - Third-party dependency notices: [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).

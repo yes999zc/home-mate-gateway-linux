@@ -17,7 +17,7 @@ pub use northbound::{NorthboundFault, NorthboundStatus};
 /// `protocol_operating_version`), not equality — so a mixed window (this
 /// firmware restarted first, the OLD core still compares strictly) keeps
 /// talking at 0. The 0 -> 1 bump is a separate paired release once the
-/// whole fleet runs the mechanism (home-mate-b#8 / #11, 2026-11-16).
+/// whole fleet runs the mechanism (2026-11-16).
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Lowest peer protocol version this build accepts (see PROTOCOL_VERSION).

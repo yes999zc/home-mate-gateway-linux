@@ -70,7 +70,7 @@ copy_unxz_if_available() {
     for cand in \
         "$OUT_DIR/unxz" \
         "$HERE/out/lx06/unxz" \
-        "/private/tmp/lx06-bundle/unxz"; do
+        "${UNXZ_CACHE_DIR:-$HOME/.home-mate/lx06-cache}/unxz"; do
         if [[ -s "$cand" ]]; then
             if [[ "$cand" != "$OUT_DIR/unxz" ]]; then
                 cp "$cand" "$OUT_DIR/unxz"
@@ -156,12 +156,23 @@ PY
     exit 0
 fi
 
-CORE_REPO="${CORE_REPO:-$(cd "$HERE/../home mate b" && pwd)}"
+if [[ -z "${CORE_REPO:-}" ]]; then
+    for cand in "$HERE/../home-mate" "$HERE/../home mate b"; do
+        if [[ -d "$cand" ]]; then
+            CORE_REPO="$(cd "$cand" && pwd)"
+            break
+        fi
+    done
+fi
+if [[ -z "${CORE_REPO:-}" || ! -d "$CORE_REPO" ]]; then
+    echo "pack_lx06_bundle: home-mate core repo not found (checked ../home-mate; set CORE_REPO=/path/to/home-mate)" >&2
+    exit 1
+fi
 if [[ -z "${VAD_MODEL:-}" ]]; then
     for cand in \
         "$CORE_REPO/models/silero_vad.onnx" \
-        "$HOME/AI_Workspace/03_Data/Models/sherpa-onnx/silero_vad.onnx" \
-        "$HERE/models/silero_vad.onnx"; do
+        "$HERE/models/silero_vad.onnx" \
+        "$HOME/.home-mate/models/silero_vad.onnx"; do
         if [[ -s "$cand" ]]; then
             VAD_MODEL="$cand"
             break
@@ -212,9 +223,9 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
     echo "=== [2/4] Building LX06 hm-gateway (aarch64-unknown-linux-musl) ==="
     (cd "$HERE" && ./tools/build_firmware_lx06.sh)
 
-    if [[ "$STANDALONE_ASR_MODE" -eq 0 && -d "${SHERPA_PKG:-/private/tmp/sherpa-pkg}" ]]; then
+    if [[ "$STANDALONE_ASR_MODE" -eq 0 && -n "${SHERPA_PKG:-}" && -d "$SHERPA_PKG" ]]; then
         echo "=== [2b/4] Rebuilding aarch64 hm-kws sidecar ==="
-        SHERPA_PKG="${SHERPA_PKG:-/private/tmp/sherpa-pkg}" "$HERE/kws/build.sh"
+        SHERPA_PKG="$SHERPA_PKG" "$HERE/kws/build.sh"
     fi
 fi
 
@@ -337,7 +348,7 @@ cp "$HERE/deploy/lx06/init.sh" "$OUT_DIR/init.sh"
 chmod 0755 "$OUT_DIR/init.sh"
 
 # Pack hm-kws-lx06.tar.xz if base runtime directory or archive is available (skipped in --standalone-asr mode)
-KWS_BASE_DIR="${KWS_BASE_DIR:-/private/tmp/lx06-bundle/kws-extract}"
+KWS_BASE_DIR="${KWS_BASE_DIR:-$HOME/.home-mate/kws-build/bundle}"
 if [[ "$STANDALONE_ASR_MODE" -eq 0 && -d "$KWS_BASE_DIR" && -f "$KWS_BASE_DIR/ld-linux-aarch64.so.1" ]]; then
     echo "=== [4/4] Packing KWS sidecar bundle: $OUT_DIR/hm-kws-lx06.tar.xz ==="
     python3 - "$KWS_BASE_DIR" "$KWS_BIN" "$KWS_RUN" "$OUT_DIR" <<'PY'
