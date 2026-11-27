@@ -63,8 +63,10 @@
 ## 分目标部署说明
 
 ### 目标 1：Amazon Echo Dot 2 (`dot2`)
-- **前提条件**：已解锁 Bootrom 并刷入自定义 emOS（如 `firebreak` / `amonet`）。
-- **构建命令**：`./tools/build_firmware.sh`（使用 `rust-lld` + Rust musl `mallocng` 链接，并强制过 `elf_assert.py` 与 16 MiB 体积门禁）。
+- **前提条件（从原厂到 `emOS`）**：
+  1. 先用 **[`yes999zc/firebreak`](https://github.com/yes999zc/firebreak)**（`uvx firebreak@latest`，基于 `amonet`）通过 Micro-USB 解锁 Bootrom 并备份原厂 `p10`（解锁前切勿在 Alexa App 里联网升级）。
+  2. 克隆上游 **[`wilbowes/EchoMuse`](https://github.com/wilbowes/EchoMuse)**，按其 **[`emos/`](https://github.com/wilbowes/EchoMuse/tree/main/emos)** 目录向导（`emos-v0.10+`）用本机内核/DTB 刷入 **`emOS`** 轻量 Linux 音频底座（后续如需返回 TWRP，执行 `/init recovery` 即可），并在 USB 串口执行 `em-wifi` 连上家庭 Wi-Fi（确认返回 `ID=emos`）。
+- **构建与部署**：`./tools/build_firmware.sh`（使用 `rust-lld` + Rust musl `mallocng` 链接，并强制过 `elf_assert.py` 与 16 MiB 体积门禁），随后按 **[`yes999zc/home-mate` 轨道 B](https://github.com/yes999zc/home-mate/blob/main/README.zh-CN.md#%E8%BD%A8%E9%81%93-b%E4%BA%9A%E9%A9%AC%E9%80%8A-echo-dot-2-rs03qr--aeobc--%E4%BB%8E%E5%8E%9F%E5%8E%82%E5%88%B0%E5%BC%80%E5%8F%A3%E5%AF%B9%E8%AF%9D%E5%AE%8C%E6%95%B4%E6%8C%87%E5%8D%97)** 完成自签名打包、`build_bootstrap.py` 制种与 `./tools/hm-provision.sh` 一键串口刷入。
 
 ### 目标 2：小米小爱音箱 Pro `LX06` 256 MB (`lx06-256m`)
 - **前提条件**：已通过 [idootop/open-xiaoai](https://github.com/idootop/open-xiaoai) 开启 Root SSH，`MemTotal >= 180,000 kB`，且 `/data` 剩余空间 `>= 6.0 MiB`（`df -h /data`）。
@@ -177,13 +179,17 @@ chmod +x build/lx06/init.sh build/lx06/unxz
   请参考 `crates/gateway/src/firmware/lx06_vendor.rs`（`wants_pns` 与 `!local_kws_enabled` 分支，以及监听 `/tmp/mico_aivs_lab/instruction.log` 原厂唤醒事件触发停播），在本地为我做一版针对 `!local_kws_enabled` 模式的定制改动，再用 `./tools/build_firmware_lx06.sh` 重编打包部署（默认发布版为保障 256 MB 双唤醒稳定性不包含此项改动）。
 ```
 
-### 提示词 C：Amazon Echo Dot 2 (`dot2`) 编译与本地验证
+### 提示词 C：Amazon Echo Dot 2 (`dot2`) 端到端编译、自签名与串口部署
 ```text
-请帮我编译并验证 Amazon Echo Dot 2（目标 1，`board-dot2`，`armv7-unknown-linux-musleabihf`）版本的 Home Mate Linux Device Gateway：
+请帮我编译并部署 Amazon Echo Dot 2（目标 1，`board-dot2`，型号 `RS03QR` / `AEOBC`）版本的 Home Mate：
 
-1. 切勿直接手打 `cargo zigbuild`（Zig 自带 musl 的 SmpAllocator 会导致设备端 RSS 持续上涨触发 OOM），请务必使用 `./tools/build_firmware.sh`（使用 `rust-lld` + Rust musl `mallocng`，自动执行 `elf_assert.py` 与 16 MiB `size_gate.py`）。
-2. 编译前先执行本地校验：`python3 tools/line_gate.py`、`cargo fmt --all -- --check`、三矩阵 `cargo clippy -- -D warnings` 与 `cargo test --workspace --locked -- --test-threads=1`。
-3. 与 `yes999zc/home-mate` 的全量版 `hm-core`（`./tools/build_core.sh`，回环 `127.0.0.1:8932`）配套部署，声学参数按单台实测配置，切勿跨机复制。
+1. 前置检查：
+   - 确认已用 `https://github.com/yes999zc/firebreak`（`uvx firebreak@latest`）解锁并备份原厂 `p10`，且已从上游 `https://github.com/wilbowes/EchoMuse`（`emos/` 目录）刷入 `emOS` 底座并通过串口 `em-wifi` 联网（`cat /etc/os-release` 返回 `ID=emos`）。
+2. 在 `yes999zc/home-mate-gateway-linux` 下：
+   - 切勿直接手打裸 `cargo zigbuild`（Zig 自带 musl 的 SmpAllocator 会导致设备端 RSS 持续上涨触发 OOM），请务必使用 `./tools/build_firmware.sh`（`rust-lld` + Rust musl `mallocng`，自动执行 `elf_assert.py` 与 16 MiB `size_gate.py`）。
+   - 编译前先执行本地校验：`python3 tools/line_gate.py`、`cargo fmt --all -- --check`、三矩阵 `cargo clippy -- -D warnings` 与 `cargo test --workspace --locked -- --test-threads=1`。
+3. 在平级目录 `yes999zc/home-mate` 下：
+   - 生成我自己的 Ed25519 密钥（`~/.home-mate/signing/release-signing-key.hex`），把公钥写入 `deploy/release/release-pubkey.hex` 后编 `hm-release`（`./tools/build_release.sh`）、全量 `hm-core`（`./tools/build_core.sh`）与 `web/dist`，用 `hm-release pack` 签名打包，运行 `python3 tools/build_bootstrap.py --allow-empty-wake-acks` 生成种子包，先跑 `./tools/hm-provision.sh --dry-run` 预检再正式激活；声学参数按单台实测，切勿跨机复制。
 ```
 
 ---

@@ -64,13 +64,15 @@ Before deploying to a Xiaomi AI Speaker Pro (`LX06`), always run `free -m` or `g
 
 ### Target 1: Amazon Echo Dot 2 (`dot2`)
 
-- **Prerequisites**: Unlocked bootrom running custom emOS (via `firebreak` / `amonet`).
+- **Prerequisites (From Stock to `emOS`)**:
+  1. Unlock Bootrom over Micro-USB via **[`yes999zc/firebreak`](https://github.com/yes999zc/firebreak)** (`uvx firebreak@latest`, based on `amonet`) and keep your stock `p10` backup (do NOT update stock firmware via the Alexa App first).
+  2. Flash upstream **`emOS`** from **[`wilbowes/EchoMuse`](https://github.com/wilbowes/EchoMuse)** ([`emos/`](https://github.com/wilbowes/EchoMuse/tree/main/emos) directory, `emos-v0.10+`) around your device's own kernel/DTB (you can return to TWRP anytime via `/init recovery`), then run **`em-wifi`** on the USB serial console (`/dev/cu.usbmodem*` or `/dev/ttyACM*`) until `ID=emos` is online.
 - **Audio & Peripherals**: 9ch `S24_3LE` 16 kHz capture (7 mics + ch8 hardware loopback reference), SpeexDSP MIMO AEC, 12× IS31FL3236 RGB ring, hardware buttons, local Sherpa-ONNX KWS sidecar (code default `0.25 / 3.00`; calibrated Dot2 field baseline `0.32 / 2.50`).
-- **Build**:
+- **Build & Provision**:
   ```bash
   ./tools/build_firmware.sh
   ```
-  Produces a static `armv7-unknown-linux-musleabihf` binary linked with `rust-lld` + Rust's musl `mallocng`, verified by `tools/elf_assert.py` and the 16 MiB OTA `tools/size_gate.py`.
+  Produces a static `armv7-unknown-linux-musleabihf` binary linked with `rust-lld` + Rust's musl `mallocng`, verified by `tools/elf_assert.py` and the 16 MiB OTA `tools/size_gate.py`. Then follow **[`yes999zc/home-mate` Track B](https://github.com/yes999zc/home-mate#track-b-amazon-echo-dot-2-rs03qr--aeobc--from-stock-to-talking)** to self-sign `home-mate-release.tar`, generate the bootstrap seed (`build_bootstrap.py`), and provision via `./tools/hm-provision.sh`.
 
 ### Target 2: Xiaomi AI Speaker Pro `LX06` — 256 MB RAM (`lx06-256m`)
 
@@ -186,13 +188,18 @@ My Xiaomi AI Speaker Pro (LX06) at 192.168.1.10 is the 128 MB RAM batch (MemTota
   Inspect `crates/gateway/src/firmware/lx06_vendor.rs` (`wants_pns` under `!local_kws_enabled` + `/tmp/mico_aivs_lab/instruction.log` native-wake detection to stop Home Mate playback), patch locally, and rebuild via `./tools/build_firmware_lx06.sh` (kept out of upstream defaults to preserve 256 MB dual-wake stability).
 ```
 
-### Prompt C — Amazon Echo Dot 2 (`dot2`) Build & Local Verification
+### Prompt C — Amazon Echo Dot 2 (`dot2`) End-to-End Build, Self-Sign & Provision
 ```text
-Help me build and verify Home Mate Linux Device Gateway for Amazon Echo Dot 2 (Target 1, `board-dot2`, `armv7-unknown-linux-musleabihf`):
+Help me build and provision Home Mate onto my Amazon Echo Dot 2 (Target 1, `board-dot2`, `RS03QR` / `AEOBC`):
 
-1. Do NOT run raw `cargo zigbuild` manually (Zig's musl SmpAllocator leaks RSS on-device). Always use `./tools/build_firmware.sh`, which links with `rust-lld` + Rust musl `mallocng` and enforces `tools/elf_assert.py` + the 16 MiB `tools/size_gate.py`.
-2. Run host checks first: `python3 tools/line_gate.py`, `cargo fmt --all -- --check`, 3-matrix `cargo clippy -- -D warnings`, and `cargo test --workspace --locked -- --test-threads=1`.
-3. Pair with full `aarch64-unknown-linux-musl` `hm-core` from `yes999zc/home-mate` (`./tools/build_core.sh`, loopback `127.0.0.1:8932`) without copying acoustic calibration parameters from another Dot2 unit.
+1. Prerequisites check:
+   - Ensure Bootrom is unlocked via `https://github.com/yes999zc/firebreak` (`uvx firebreak@latest`) with stock `p10` backed up, and upstream `emOS` from `https://github.com/wilbowes/EchoMuse` (`emos/` directory) is flashed and connected to Wi-Fi via `em-wifi` (`cat /etc/os-release` shows `ID=emos`).
+2. In `yes999zc/home-mate-gateway-linux`:
+   - Do NOT run raw `cargo zigbuild` manually (Zig's musl SmpAllocator leaks RSS on-device). Always use `./tools/build_firmware.sh` (`rust-lld` + Rust musl `mallocng`, enforcing `tools/elf_assert.py` + 16 MiB `tools/size_gate.py`).
+   - Run host checks first: `python3 tools/line_gate.py`, `cargo fmt --all -- --check`, 3-matrix `cargo clippy -- -D warnings`, and `cargo test --workspace --locked -- --test-threads=1`.
+3. In sibling `yes999zc/home-mate`:
+   - Generate my own Ed25519 signing key (`~/.home-mate/signing/release-signing-key.hex`), embed its pubkey into `deploy/release/release-pubkey.hex`, build `hm-release` (`./tools/build_release.sh`), full `hm-core` (`./tools/build_core.sh`), and `web/dist`, pack & sign `home-mate-release.tar`, build the seed with `python3 tools/build_bootstrap.py --allow-empty-wake-acks`, and run `./tools/hm-provision.sh --dry-run` before live activation.
+   - Never copy acoustic calibration parameters from another Dot 2 unit.
 ```
 
 ---
