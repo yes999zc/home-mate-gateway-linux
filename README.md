@@ -137,7 +137,7 @@ chmod +x build/lx06/init.sh build/lx06/unxz
 
 #### Honest Trade-offs of Both 128 MB Modes
 1. **Option 3A (Thin Gateway + NAS)**: Depends on LAN NAS & Wi-Fi and lacks on-device KWS, but gets full server-side **Silero neural VAD** (accurate noise rejection) and ~50 MiB free speaker RAM.
-2. **Option 3B (Standalone Pure-ASR, No NAS)**: 100% self-contained on the speaker with zero NAS required; because `hm-kws` is omitted and `--slim` falls back to **energy VAD + cloud ASR wake (`proactive_asr_wake`)**, trade-offs are: (a) louder background TV/noise can trigger extra cloud ASR calls, (b) wake latency is ~0.5–1.5 s slower than local KWS, and (c) no local wake/exit words or reliable mid-music voice barge-in (control playback via button, Web console, or Android app).
+2. **Option 3B (Standalone Pure-ASR, No NAS)**: 100% self-contained on the speaker with zero NAS required; because `hm-kws` is omitted and `--slim` falls back to **energy VAD + cloud ASR wake (`proactive_asr_wake`)**, trade-offs are: (a) louder background TV/noise can trigger extra cloud ASR calls, (b) wake latency is ~0.5–1.5 s slower than local KWS, and (c) no local wake/exit words or reliable mid-music voice barge-in (control playback via button, Web console, or Android app; power users can optionally ask their AI coding agent to customize `lx06_vendor.rs` as noted in Prompt B below to interrupt playback by saying "XiaoAi TongXue").
 3. **Default Auto-Selection**: `deploy/lx06/init.sh` defaults to safe Thin Mode (3A) whenever `MemTotal < 180000` kB; Standalone Pure-ASR (3B) is explicitly enabled via `/data/hm/standalone-asr` (`--standalone-asr`) or `HM_STANDALONE_ASR=1`.
 
 ---
@@ -181,6 +181,9 @@ My Xiaomi AI Speaker Pro (LX06) at 192.168.1.10 is the 128 MB RAM batch (MemTota
   2. Download `hm-bundle.tar.xz`, `hm-bundle.sha256`, `init.sh`, and `unxz` into `build/lx06/` and verify SHA-256.
   3. Run `./deploy/lx06/install-lx06.sh --standalone-asr --device-ip 192.168.1.10 --device-id lx06-standalone`.
   4. Verify ONLY `hm-core` (`HM_VOICE_EVENTS=0`) and `hm-gateway` (no `hm-kws`) run, `http://192.168.1.10:8930` returns HTTP 200, and note the energy VAD + cloud ASR wake trade-offs.
+
+- Optional DIY Customization (if I want to interrupt Home Mate playback by saying "小爱同学 / XiaoAi TongXue" in 128 MB non-KWS mode):
+  Inspect `crates/gateway/src/firmware/lx06_vendor.rs` (`wants_pns` under `!local_kws_enabled` + `/tmp/mico_aivs_lab/instruction.log` native-wake detection to stop Home Mate playback), patch locally, and rebuild via `./tools/build_firmware_lx06.sh` (kept out of upstream defaults to preserve 256 MB dual-wake stability).
 ```
 
 ### Prompt C — Amazon Echo Dot 2 (`dot2`) Build & Local Verification

@@ -79,6 +79,7 @@ Behavior & trade-offs in Standalone Pure-ASR mode:
 - `/data/hm/standalone-asr` (or `HM_STANDALONE_ASR=1`) overrides `< 180000` kB auto-thin (while explicit `/data/hm/thin-mode` / `HM_THIN_MODE=1` still wins).
 - `init.sh` launches `hm-core` with **`HM_VOICE_EVENTS=0`** (preventing `/tmp/hm-voice-events` from filling the 58 MiB `/tmp` tmpfs) and omits `HM_SILERO_VAD` / `KWS_VAD_MODEL` / `--kws` / `fetch_kws_if_needed`.
 - `hm-core --slim` automatically falls back to **energy VAD + cloud `proactive_asr_wake`**: louder background TV/noise can trigger extra cloud ASR calls, wake latency is ~0.5–1.5 s slower than local KWS, and mid-music voice barge-in is weak (control playback via button, Web console, or Android app).
+- **Optional DIY Tip (Wake Stock XiaoAi to Interrupt Playback)**: By default, `VendorMonitor` (`crates/gateway/src/firmware/lx06_vendor.rs`) pauses stock `pns` during Home Mate playback to keep 256 MB dual-wake clean. In 128 MB non-KWS modes (`!local_kws_enabled`), users who want *"say '小爱同学' to interrupt Home Mate playback"* can ask their AI agent to patch `wants_pns` + native-busy playback stop in `lx06_vendor.rs` locally and rebuild via `./tools/build_firmware_lx06.sh`.
 
 ## Verification & Device Acceptance
 

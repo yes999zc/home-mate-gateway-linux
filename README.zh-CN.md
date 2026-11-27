@@ -128,7 +128,7 @@ chmod +x build/lx06/init.sh build/lx06/unxz
 
 #### 128 MB 两种模式的架构取舍（如实告知）
 1. **方案 3A（瘦网关 + NAS）**：依赖局域网 NAS 与 Wi-Fi，无音箱端本地 KWS，但 NAS 侧拥有完整 **Silero 神经网络 VAD**（抗环境噪音准、不乱费 ASR 额度），且音箱内存最宽裕（剩 ~50 MiB）。
-2. **方案 3B（无 NAS 单机纯 ASR）**：完全不依赖 NAS、开箱即用 `:8930` 控制台；但因关闭了 `hm-kws` 且 `--slim` 自动回退到**能量 VAD + 云端 ASR 唤醒**，存在以下取舍：① 电视/环境较吵时能量 VAD 容易误送背景音去云端 ASR；② 唤醒比本地 KWS 慢约 `0.5~1.5 秒`；③ 无本地热词打断/本地退出词，放歌期间语音打断较弱（可通过物理按键、控制台或手机 App 控播）。
+2. **方案 3B（无 NAS 单机纯 ASR）**：完全不依赖 NAS、开箱即用 `:8930` 控制台；但因关闭了 `hm-kws` 且 `--slim` 自动回退到**能量 VAD + 云端 ASR 唤醒**，存在以下取舍：① 电视/环境较吵时能量 VAD 容易误送背景音去云端 ASR；② 唤醒比本地 KWS 慢约 `0.5~1.5 秒`；③ 无本地热词打断/本地退出词，放歌期间语音打断较弱（可通过物理按键、控制台或手机 App 控播；进阶玩法亦可让 AI 助手按下方提示词修改 `lx06_vendor.rs` 实现“放歌时喊小爱同学直接打断”）。
 3. **默认自动分流**：`deploy/lx06/init.sh` 在 `MemTotal < 180000` kB 时默认自动进入安全的瘦模式（3A）；仅当显式写入 `/data/hm/standalone-asr`（由 `--standalone-asr` 安装）或 `HM_STANDALONE_ASR=1` 时启用单机纯 ASR 模式（3B）。
 
 ---
@@ -172,6 +172,9 @@ chmod +x build/lx06/init.sh build/lx06/unxz
   2. 下载 `hm-bundle.tar.xz`、`hm-bundle.sha256`、`init.sh`、`unxz` 到 `build/lx06/` 并校验 SHA-256。
   3. 执行 `./deploy/lx06/install-lx06.sh --standalone-asr --device-ip 192.168.1.10 --device-id lx06-standalone`。
   4. 验证音箱仅运行 `hm-core`（`HM_VOICE_EVENTS=0`）和 `hm-gateway`（不运行 `hm-kws`），`http://192.168.1.10:8930` 返回 200，并提醒我该模式使用能量 VAD + 云端 ASR 唤醒。
+
+- 可选进阶改造（如我希望 128 MB 无 KWS 模式下“放歌时喊一声‘小爱同学’就能把小瑞打断停播”）：
+  请参考 `crates/gateway/src/firmware/lx06_vendor.rs`（`wants_pns` 与 `!local_kws_enabled` 分支，以及监听 `/tmp/mico_aivs_lab/instruction.log` 原厂唤醒事件触发停播），在本地为我做一版针对 `!local_kws_enabled` 模式的定制改动，再用 `./tools/build_firmware_lx06.sh` 重编打包部署（默认发布版为保障 256 MB 双唤醒稳定性不包含此项改动）。
 ```
 
 ### 提示词 C：Amazon Echo Dot 2 (`dot2`) 编译与本地验证
