@@ -83,6 +83,21 @@ Behavior & trade-offs in Standalone Pure-ASR mode:
 
 ## Verification & Device Acceptance
 
+### Full-mode KWS download recovery
+
+In 256 MB full mode the KWS runtime lives in `/tmp` and must be fetched again
+after a reboot. If its host is unavailable or its checksum fails, the supervisor
+starts the gateway without local KWS instead of leaving all gateway functions
+offline. The Core's existing ASR wake settings remain authoritative: this does
+not enable cloud recognition if the user disabled it. ASR wake requires a working
+configured recognition service and may have higher latency than local KWS.
+
+The supervisor retries once per minute while Core reports no active listening,
+capture, recognition or playback. After a verified model download it rechecks
+those idle facts before restarting the gateway with local KWS. Missing auth or an
+unavailable status endpoint defers recovery rather than interrupting a conversation.
+Explicit thin, standalone-ASR and native-pinned modes retain their existing behavior.
+
 Run host-side supervisor tests covering 256 MB full mode, 128 MB thin mode, and 128 MB standalone pure-ASR mode (cold boot, cache reuse, mode precedence, `HM_VOICE_EVENTS=0`, thin bundle, full-bundle stripping, `core.addr`/`core.token`, `< 180000 kB` auto-detection, and `install-lx06.sh` CLI conflict checks):
 
 ```sh

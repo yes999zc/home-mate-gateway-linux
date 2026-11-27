@@ -26,6 +26,7 @@ KWS_PERSIST_FILES="kw.txt kw.exit.json kw.tuning.json kw.bundle.json"
 KWS_SYNC_BACKOFF_MAX=60
 kws_sync_fail_streak=0
 kws_sync_cooldown=0
+kws_retry_at=0
 
 # 128 MB RAM LX06 batch (MemTotal ~118,760 kB, /tmp tmpfs ~59 MB) cannot host
 # on-device hm-core + hm-kws without OOM.
@@ -402,6 +403,23 @@ init_state_if_needed() {
     fi
 }
 
+core_idle_for_kws_recovery() {
+    token=$(cat "$HM_STATE_DIR/local-release.token" 2>/dev/null) || return 1
+    [ -n "$token" ] || return 1
+    device=$(cat "$HM_STATE_DIR/device-id" 2>/dev/null) || device=lx06
+    case "$device" in ''|*[!a-zA-Z0-9_-]*) return 1 ;; esac
+    status=$(curl -fsS --max-time 2 -H "Authorization: Bearer $token" \
+        "http://127.0.0.1:8930/api/v0/mode?device=$device" 2>/dev/null) || return 1
+    # The Core endpoint emits compact JSON. Require affirmative idle facts;
+    # a wake being captured or recognized may still have an idle indicator.
+    case "$status" in *'"assistant_state":"idle"'*) ;; *) return 1 ;; esac
+    case "$status" in *'"input_window_open":false'*) ;; *) return 1 ;; esac
+    case "$status" in *'"in_speech":false'*) ;; *) return 1 ;; esac
+    case "$status" in *'"asr_inflight":0'*) ;; *) return 1 ;; esac
+    case "$status" in *'"input_id":'*) return 1 ;; esac
+    [ "$(cat "$HM_FLASH_DIR/mode" 2>/dev/null)" = homemate ]
+}
+
 # One iteration is shared by boot, hot selection and supervisor recovery.
 supervise_tick() {
     mode=$(tr -d '\r\n ' < "$HM_FLASH_DIR/mode" 2>/dev/null)
@@ -516,8 +534,17 @@ supervise_tick() {
     fi
 
     if ! runtime_pid hm-gateway firmware >/dev/null; then
-        if ! fetch_kws_if_needed; then
-            return 1
+        # A missing model host must not disable microphones, buttons and the
+        # already-configured Core ASR wake fallback. Keep SHA verification;
+        # only a verified runtime is ever used for local KWS.
+        set --
+        if fetch_kws_if_needed; then
+            set -- --kws --kws-dir "$KWS_DIR" --kws-cpu 3
+            rm -f "$HM_RUN_DIR/.kws-asr-fallback"
+        else
+            : > "$HM_RUN_DIR/.kws-asr-fallback"
+            kws_retry_at=$(( $(date +%s) + 60 ))
+            echo "$(date) KWS unavailable; starting gateway with Core ASR wake fallback" >> "$WD_LOG"
         fi
         dev_id="lx06"
         if [ -s "$HM_STATE_DIR/device-id" ]; then
@@ -531,10 +558,24 @@ supervise_tick() {
             "$HM_RUN_DIR/hm-gateway" firmware --core 127.0.0.1:8932 \
             --device-id "$dev_id" --model LX06 \
             --state-dir "$HM_STATE_DIR" --aec --barge-in off --loudness-bass 0.0 \
-            --loopback-probe --kws --kws-dir "$KWS_DIR" --kws-cpu 3 \
+            --loopback-probe "$@" \
             --volume-cap "$vol_cap" >> "$GW_LOG" 2>&1 &
     else
         sync_kws_config || true
+        if [ -f "$HM_RUN_DIR/.kws-asr-fallback" ]; then
+            now_s=$(date +%s)
+            if [ "$now_s" -ge "$kws_retry_at" ]; then
+                kws_retry_at=$((now_s + 60))
+                # Upgrade back to local KWS only between conversations. No
+                # auth or status response means defer, never interrupt audio.
+                if core_idle_for_kws_recovery; then
+                    if fetch_kws_if_needed && core_idle_for_kws_recovery; then
+                        echo "$(date) KWS model recovered; restarting idle gateway" >> "$WD_LOG"
+                        stop_runtime firmware
+                    fi
+                fi
+            fi
+        fi
     fi
 }
 
