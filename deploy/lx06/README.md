@@ -22,7 +22,14 @@ Install in one command:
 
 After boot, verify `devices[].mic.vad.endpoint.kind` is `gateway_vad` through `/api/v0/mode`. The supervisor checks the unpacked gateway's shared-audio contract (`lx06-idle-wake-v1`) before activation.
 
-## Mode 2: 128 MB RAM Thin Gateway (`lx06-128m`)
+## Mode 2: 128 MB RAM Thin Gateway (`lx06-128m` — Experimental)
+
+> [!WARNING]
+> **Experimental / Unverified on 128 MB Hardware — Lower Expectations**:
+> The maintainer currently only owns and hardware-tests the **256 MB LX06 batch**. All 128 MB modes below (`--thin` and `--standalone-asr`) are **Experimental** and have not yet undergone sustained 128 MB physical-device stress testing. On 128 MB units (`MemTotal ≈ 118,760 kB`), stock XiaoAi leaves only **~51 MiB** of available RAM; community 128 MB testers have reported **severe stutter, high CPU load, memory pressure, and degraded wake reliability (even for stock "XiaoAi")** when coexisting with native XiaoAi:
+> - **Mode 3 (`--standalone-asr`) is NOT recommended for daily use**: unpacking `hm-core` (~13.6 MiB) into RAM-backed `/tmp` plus runtime RSS leaves very little page cache, triggering flash paging and high load.
+> - **Mode 2 (`--thin` + LAN NAS)** uses far less RAM, but `hm-gateway` currently still runs continuous `arecord -D noop` + `SCHED_FIFO` capture + SpeexDSP AEC alongside stock `mipns-xiaomi` without local KWS, so CPU contention and slower cloud-ASR wake latency remain possible until 128 MB hardware tuning is completed.
+> - **Recommended alternative**: For reliable dual-wake LX06 operation, use a **256 MB batch** unit; for 128 MB owners seeking hassle-free daily use, consider a repurposed Android phone/tablet/86 wall panel with NAS Docker Core instead. You can always restore a 128 MB LX06 to 100% stock with `rm -rf /data/hm /data/init.sh && reboot`.
 
 > **Community credit**: Thanks to **@jiantongzh** for validating the 128 MB LX06 batch (`MemTotal ≈ 118,760 kB`, `/tmp tmpfs ≈ 59 MB`) and contributing the initial Thin Mode design.
 

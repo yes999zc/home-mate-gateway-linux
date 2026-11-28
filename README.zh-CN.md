@@ -52,9 +52,9 @@
 | 目标形态 | 硬件型号与内存规格 | 目标架构与 Cargo Feature | 运行形态 | Core 位置与连接方式 |
 | :--- | :--- | :--- | :--- | :--- |
 | **目标 1：Amazon Echo Dot 2 (`dot2`)** | Echo Dot 2 (`AEOBC` / `RS03QR`), 512 MB RAM | `armv7-unknown-linux-musleabihf`<br/>`board-dot2`（默认）+ `clock32` | 本机独立运行：全量 `hm-core` + `hm-gateway` + 本地 `hm-kws`（代码默认 `0.25/3.00`；实机标定基线 `0.32/2.50`），7 麦 + ch8 回环 AEC、12 颗灯环、A/B 槽 OTA | **音箱本机** 全量 `hm-core`，回环 `127.0.0.1:8932` |
-| **目标 2：小米小爱 Pro `LX06` 256 MB (`lx06-256m`)** | `LX06` 256 MB 批次（`MemTotal >= 180,000 kB`，`/tmp` 约 120 MiB） | `aarch64-unknown-linux-musl`<br/>`--no-default-features --features board-lx06` | 本机独立双唤醒：`hm-core --slim` + `hm-gateway` + 本地 `hm-kws`（`0.20/2.50`，`gateway_vad`），方案 A（零改动 SquashFS），与原厂小爱共存 | **音箱本机** `hm-core --slim`，回环 `127.0.0.1:8932` |
-| **目标 3A：小米小爱 Pro `LX06` 128 MB 瘦网关（推荐有 NAS）** | `LX06` 128 MB 批次（`MemTotal < 180,000 kB`，约 118 MB RAM、`/tmp` 约 59 MiB） | `aarch64-unknown-linux-musl`<br/>`--no-default-features --features board-lx06` | 仅网关瘦客户端：`hm-lx06-thin.tar.xz`（压缩 ~606 KB / 运行仅 ~4 MiB RAM），不跑本机 `hm-core` 与 `hm-kws`，零改动 SquashFS | **局域网 NAS / 服务器上的全量 Docker `hm-core`**（带 Silero VAD，直连局域网 `:8932` 或 SSH 反向隧道） |
-| **目标 3B：小米小爱 Pro `LX06` 128 MB 无 NAS 单机纯 ASR（尝鲜）** | `LX06` 128 MB 批次（`MemTotal < 180,000 kB`，无 NAS/服务器） | `aarch64-unknown-linux-musl`<br/>`--no-default-features --features board-lx06` | 本机纯 ASR：`hm-core --slim`（`HM_VOICE_EVENTS=0`，能量 VAD + 云端 ASR 唤醒）+ `hm-gateway`，**跳过 `hm-kws`**（净吃 ~26–31 MiB RAM，余量 ~22–30 MiB），零改动 SquashFS | **音箱本机** `hm-core --slim`，回环 `127.0.0.1:8932`（无需 NAS） |
+| **目标 2：小米小爱 Pro `LX06` 256 MB (`lx06-256m`，已实机验收)** | `LX06` 256 MB 批次（`MemTotal >= 180,000 kB`，`/tmp` 约 120 MiB） | `aarch64-unknown-linux-musl`<br/>`--no-default-features --features board-lx06` | 本机独立双唤醒：`hm-core --slim` + `hm-gateway` + 本地 `hm-kws`（`0.20/2.50`，`gateway_vad`），方案 A（零改动 SquashFS），与原厂小爱共存 | **音箱本机** `hm-core --slim`，回环 `127.0.0.1:8932` |
+| **目标 3A：小米小爱 Pro `LX06` 128 MB 瘦网关（实验性 · 需 NAS）** | `LX06` 128 MB 批次（`MemTotal < 180,000 kB`，约 118 MB RAM、`/tmp` 约 59 MiB） | `aarch64-unknown-linux-musl`<br/>`--no-default-features --features board-lx06` | 实验性仅网关瘦客户端：`hm-lx06-thin.tar.xz`（压缩 ~607 KB），不跑本机 `hm-core` 与 `hm-kws`，零改动 SquashFS *（尚未经 128 MB 真机验收）* | **局域网 NAS / 服务器上的全量 Docker `hm-core`**（带 Silero VAD，直连局域网 `:8932` 或 SSH 反向隧道） |
+| **目标 3B：小米小爱 Pro `LX06` 128 MB 无 NAS 单机纯 ASR（实验性 · 不推荐）** | `LX06` 128 MB 批次（`MemTotal < 180,000 kB`，无 NAS/服务器） | `aarch64-unknown-linux-musl`<br/>`--no-default-features --features board-lx06` | 实验性本机纯 ASR：`hm-core --slim`（`HM_VOICE_EVENTS=0`）+ `hm-gateway`，**跳过 `hm-kws`**；原厂小爱后仅剩 ~51 MiB 内存，极易高负载卡顿与唤醒困难 | **音箱本机** `hm-core --slim`，回环 `127.0.0.1:8932` *（不建议日常使用）* |
 
 > **关于非 Pro 版小爱音箱**：目前仅内置验证 **LX06（小米小爱音箱 Pro）**；非 Pro 型号可参考文末 [移植新 Linux 音箱指南](#移植新-linux-音箱指南)。
 
@@ -81,13 +81,20 @@
   ```
 - **控制台与切换**：访问 `http://192.168.1.10:8930`；长按音箱顶部「播放/暂停」键 1.5 秒（`lx06-switch-watch`）即可在双唤醒（`homemate`）与原厂小爱独占模式（`xiaoai-pinned`）间自由切换。
 
-### 目标 3：小米小爱音箱 Pro `LX06` 128 MB 批次（双方案可选：有 NAS 瘦网关 / 无 NAS 单机纯 ASR）
+### 目标 3：小米小爱音箱 Pro `LX06` 128 MB 批次（实验性支持：有 NAS 瘦网关 / 无 NAS 单机纯 ASR）
+
+> [!WARNING]
+> **实验性 / 尚未经 128 MB 真机验收 — 请务必降低预期**：
+> 维护者目前仅持有并长期验收了 **256 MB 批次 LX06**，**以下 128 MB 模式均属实验性支持，尚未在 128 MB 真机上做过长期压测与调优**。128 MB 批次跑完原厂小爱后可用内存仅剩约 **51 MiB**，已有社区 128 MB 真机用户反馈，在保留原厂小爱共存的情况下容易出现 **严重卡顿、CPU load 过载、内存吃紧，甚至连原厂“小爱同学”都唤醒困难**：
+> - **方案 3B（无 NAS 单机 `--standalone-asr`）不推荐日常使用**：`/tmp` 是内存盘，解包 `hm-core`（~13.6 MiB）+ 运行态会把剩余内存压到极限，极易触发闪存反复换页和卡顿。
+> - **方案 3A（有 NAS 瘦网关 `--thin`）**虽大幅降低了内存占用，但当前网关待机期仍与原厂小爱共用麦克风运行实时采音/AEC 且无本机 KWS，在 128 MB 上仍可能出现 CPU 争抢与唤醒变慢，体验明显不如 256 MB。
+> - **务实建议**：想稳定体验 LX06 双唤醒请优先使用 **256 MB 批次**；手头是 128 MB 批次且不想折腾调优的话，更推荐用闲置安卓手机/平板/86 屏搭配 **Android APK + NAS Docker Core**（随时可通过 `rm -rf /data/hm /data/init.sh && reboot` 一键恢复纯原厂小爱）。
 
 > **社区致谢**：特别感谢 **[@jiantongzh](https://github.com/jiantongzh)** 实机验证 128 MB 批次 LX06 规格并贡献最初的 Thin Mode 瘦网关设计！
-> **免编译直装**：`v0.0.54` 起 GitHub Releases 已同时挂载预编译成品包（`hm-lx06-thin.tar.xz` 约 `606 KB`、`hm-bundle.tar.xz` 约 `5.0 MiB`、`init.sh`、`unxz` 与 `SHA256SUMS.txt`），**无需安装 Rust 交叉编译工具链即可直接下载安装**。
+> **免编译直装**：`v0.0.54` 起 GitHub Releases 已同时挂载预编译成品包（`hm-lx06-thin.tar.xz` 约 `607 KB`、`hm-bundle.tar.xz` 约 `5.0 MiB`、`init.sh`、`unxz` 与 `SHA256SUMS.txt`），**无需安装 Rust 交叉编译工具链即可直接下载安装**。
 
-#### 方案 3A（推荐，家里有 NAS / 电脑 / 软路由）：128 MB 瘦网关 (`--thin`) + NAS 全量 Docker `hm-core`
-音箱端只跑 `hm-gateway`（仅吃 `~4 MiB` RAM，富裕 `~50 MiB`），由局域网 NAS/服务器上的**标准全量版 Docker `hm-core`**（内置 Silero 神经网络 VAD，切勿使用 `--slim`）处理对话与语音：
+#### 方案 3A（实验性 · 需家里有 NAS / 电脑 / 软路由）：128 MB 瘦网关 (`--thin`) + NAS 全量 Docker `hm-core`
+音箱端只跑 `hm-gateway`（不跑本机 `hm-core` 和 `hm-kws`），由局域网 NAS/服务器上的**标准全量版 Docker `hm-core`**（内置 Silero 神经网络 VAD，切勿使用 `--slim`）处理对话与语音：
 
 ```bash
 # 1. 在 NAS / 服务器部署标准全量版 Docker hm-core（开启 HM_GATEWAY_ALLOW_LAN=1，并在 :8930 配对令牌）
@@ -110,8 +117,8 @@ chmod +x build/lx06/init.sh build/lx06/unxz
 ```
 *（`--allow-lan-core` 仍严格仅放行回环 + RFC 1918 私网 + Tailscale `100.64/10` + IPv6 ULA `fc00::/7`，**永远拒绝公网 IP**；`--core-token` 以 `chmod 600` 存入 `/data/hm/core.token` 并通过环境变量注入。省略 `--core-addr` 则走 SSH 反向隧道 `127.0.0.1:8932`。）*
 
-#### 方案 3B（无 NAS 单机尝鲜）：128 MB 本机纯 ASR 模式 (`--standalone-asr`)
-如果手里**没有 NAS / 常开服务器**，128 MB LX06 也可以直接跳过吃掉 `50~68 MiB` 内存的本地 `hm-kws`，在本机独立运行 **`hm-core --slim`（自动禁用 `/tmp/hm-voice-events` 防撑爆 58 MB `/tmp`）+ `hm-gateway` + `:8930` 控制台**（合计净吃 `~26–31 MiB` RAM，保留 `~22–30 MiB` 安全余量，`/data` 需 ≥ `5.5 MiB` 空闲）：
+#### 方案 3B（实验性 · 不推荐日常使用）：128 MB 本机纯 ASR 模式 (`--standalone-asr`)
+仅作无 NAS 场景的实验参考：跳过本地 `hm-kws`，在本机运行 **`hm-core --slim`（`HM_VOICE_EVENTS=0`）+ `hm-gateway` + `:8930` 控制台**（`/data` 需 ≥ `5.5 MiB` 空闲）。由于 `/tmp` 是内存盘且原厂小爱后仅剩 ~51 MiB 可用，128 MB 真机极易出现内存吃紧、load 过高和唤醒困难，**不建议当作日常主力方案**：
 
 ```bash
 # 1. 免编译下载 v0.0.56 主包（也可运行 ./tools/pack_lx06_bundle.sh --standalone-asr 自行编译）

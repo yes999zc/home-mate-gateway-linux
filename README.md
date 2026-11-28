@@ -52,9 +52,9 @@ Before deploying to a Xiaomi AI Speaker Pro (`LX06`), always run `free -m` or `g
 | Target | Board / RAM | Architecture & Cargo Feature | Runtime Topology | Core Location & Link |
 | :--- | :--- | :--- | :--- | :--- |
 | **1. Amazon Echo Dot 2 (`dot2`)** | Echo Dot 2 (`AEOBC` / `RS03QR`), 512 MB RAM | `armv7-unknown-linux-musleabihf`<br/>`board-dot2` *(default)* + `clock32` | Full on-device sovereign runtime: Full `hm-core` + `hm-gateway` + local `hm-kws` (code default `0.25/3.00`; calibrated Dot2 baseline `0.32/2.50`), 7-mic + ch8 loopback AEC, 12-LED IS31FL3236 ring, A/B slot OTA | **On-device** full `hm-core` over loopback `127.0.0.1:8932` |
-| **2. Xiaomi AI Speaker Pro `LX06` 256 MB (`lx06-256m`)** | `LX06` (`MemTotal >= 180,000 kB`, ~241 MiB RAM, `/tmp` ~120 MiB) | `aarch64-unknown-linux-musl`<br/>`--no-default-features --features board-lx06` | Full on-device dual-wake runtime: `hm-core --slim` + `hm-gateway` + `hm-kws` (`0.20/2.50`, `gateway_vad`), Storage Scheme A (`/data` -> `/tmp`, zero SquashFS edits), coexists with stock XiaoAi | **On-device** `hm-core --slim` over loopback `127.0.0.1:8932` |
-| **3A. Xiaomi `LX06` 128 MB Thin Gateway *(Recommended w/ NAS)*** | `LX06` 128 MB batch (`MemTotal < 180,000 kB`, ~118 MB RAM, `/tmp` ~59 MiB) | `aarch64-unknown-linux-musl`<br/>`--no-default-features --features board-lx06` | Gateway-only thin client: `hm-lx06-thin.tar.xz` (~606 KB compressed / ~4 MiB RAM), no local `hm-core` or `hm-kws`, zero SquashFS edits | **LAN NAS / Server running Full Docker `hm-core`** (with Silero VAD, direct LAN `:8932` or SSH tunnel) |
-| **3B. Xiaomi `LX06` 128 MB Standalone Pure-ASR *(No-NAS Trial)*** | `LX06` 128 MB batch (`MemTotal < 180,000 kB`, no NAS/server) | `aarch64-unknown-linux-musl`<br/>`--no-default-features --features board-lx06` | On-device pure-ASR: `hm-core --slim` (`HM_VOICE_EVENTS=0`, energy VAD + cloud ASR wake) + `hm-gateway`, **skips `hm-kws`** (~26–31 MiB net RAM, ~22–30 MiB headroom), zero SquashFS edits | **On-device** `hm-core --slim` over loopback `127.0.0.1:8932` (no NAS required) |
+| **2. Xiaomi AI Speaker Pro `LX06` 256 MB (`lx06-256m`, Verified)** | `LX06` (`MemTotal >= 180,000 kB`, ~241 MiB RAM, `/tmp` ~120 MiB) | `aarch64-unknown-linux-musl`<br/>`--no-default-features --features board-lx06` | Full on-device dual-wake runtime: `hm-core --slim` + `hm-gateway` + `hm-kws` (`0.20/2.50`, `gateway_vad`), Storage Scheme A (`/data` -> `/tmp`, zero SquashFS edits), coexists with stock XiaoAi | **On-device** `hm-core --slim` over loopback `127.0.0.1:8932` |
+| **3A. Xiaomi `LX06` 128 MB Thin Gateway *(Experimental · w/ NAS)*** | `LX06` 128 MB batch (`MemTotal < 180,000 kB`, ~118 MB RAM, `/tmp` ~59 MiB) | `aarch64-unknown-linux-musl`<br/>`--no-default-features --features board-lx06` | Experimental gateway-only thin client: `hm-lx06-thin.tar.xz` (~607 KB compressed), no local `hm-core` or `hm-kws`, zero SquashFS edits *(not yet verified on physical 128 MB hardware)* | **LAN NAS / Server running Full Docker `hm-core`** (with Silero VAD, direct LAN `:8932` or SSH tunnel) |
+| **3B. Xiaomi `LX06` 128 MB Standalone Pure-ASR *(Experimental · Not Recommended)*** | `LX06` 128 MB batch (`MemTotal < 180,000 kB`, no NAS/server) | `aarch64-unknown-linux-musl`<br/>`--no-default-features --features board-lx06` | Experimental on-device pure-ASR: `hm-core --slim` (`HM_VOICE_EVENTS=0`) + `hm-gateway`, **skips `hm-kws`**; RAM is extremely tight (~51 MiB free after stock XiaoAi) — prone to high load & poor wake | **On-device** `hm-core --slim` over loopback `127.0.0.1:8932` *(experimental only)* |
 
 > **Other Xiaomi non-Pro models**: Only **LX06 (Xiaomi AI Speaker Pro)** is built-in and verified. See [Porting a New Linux Speaker](#porting-a-new-linux-speaker) for community ports.
 
@@ -90,13 +90,20 @@ Before deploying to a Xiaomi AI Speaker Pro (`LX06`), always run `free -m` or `g
   ```
 - **Console & Mode Switching**: Open `http://192.168.1.10:8930` (runs directly on the speaker). Long-press the Play/Pause button for 1.5 s (`lx06-switch-watch`) to toggle between dual-wake (`homemate`) and pinned stock XiaoAi (`xiaoai-pinned`).
 
-### Target 3: Xiaomi AI Speaker Pro `LX06` — 128 MB RAM (Two Options: Thin Gateway w/ NAS or Standalone Pure-ASR w/o NAS)
+### Target 3: Xiaomi AI Speaker Pro `LX06` — 128 MB RAM (Experimental: Thin Gateway w/ NAS or Standalone Pure-ASR)
+
+> [!WARNING]
+> **Experimental / Unverified on 128 MB Hardware — Please Lower Expectations**:
+> The maintainer only owns and hardware-tests the **256 MB LX06 batch**; all **128 MB modes below are currently Experimental and have NOT been stress-tested on physical 128 MB hardware**. Stock XiaoAi already leaves only ~51 MiB of available RAM on 128 MB units, and community 128 MB testers have reported **severe lag, high CPU load, memory pressure, and degraded wake reliability (even for stock "XiaoAi")** when running alongside native XiaoAi:
+> - **Option 3B (`--standalone-asr`, No NAS) is NOT recommended for daily use**: unpacking `hm-core` (~13.6 MiB) into RAM-backed `/tmp` plus runtime memory squeezes page cache to near zero and triggers flash paging/stutter.
+> - **Option 3A (`--thin` + NAS)** has a much smaller RAM footprint, but `hm-gateway` still runs continuous capture/AEC alongside stock `mipns-xiaomi` without local KWS, so responsiveness and wake reliability are still noticeably below 256 MB.
+> - **Honest recommendation**: For smooth LX06 dual-wake, use the **256 MB batch**; if you have a 128 MB unit and want reliable daily use without tuning, a **repurposed Android phone/tablet/86 panel + NAS Docker Core** is a much better fit. You can always return a 128 MB LX06 to 100% stock via `rm -rf /data/hm /data/init.sh && reboot`.
 
 > **Community Credit**: Huge thanks to **[@jiantongzh](https://github.com/jiantongzh)** for hardware-validating the 128 MB LX06 batch (`MemTotal ≈ 118,760 kB`, `/tmp tmpfs ≈ 59 MB`) and contributing the initial Thin Mode design!
-> **Zero-Compile Prebuilt Assets**: Starting with `v0.0.54`, GitHub Releases ships both prebuilt archives (`hm-lx06-thin.tar.xz` ~606 KB, `hm-bundle.tar.xz` ~5.0 MiB, `init.sh`, `unxz`, and `SHA256SUMS.txt`) so you can install directly without a Rust cross-compile toolchain.
+> **Zero-Compile Prebuilt Assets**: Starting with `v0.0.54`, GitHub Releases ships both prebuilt archives (`hm-lx06-thin.tar.xz` ~607 KB, `hm-bundle.tar.xz` ~5.0 MiB, `init.sh`, `unxz`, and `SHA256SUMS.txt`) so you can install directly without a Rust cross-compile toolchain.
 
-#### Option 3A (Recommended with NAS / Server): 128 MB Thin Gateway (`--thin`) + LAN Full Docker `hm-core`
-Runs only `hm-gateway` on the speaker (~4 MiB RAM, leaving ~50 MiB free), paired with **Full Docker `hm-core`** (with in-process Silero neural VAD — never `--slim`) on your LAN NAS/server:
+#### Option 3A (Experimental, with NAS / Server): 128 MB Thin Gateway (`--thin`) + LAN Full Docker `hm-core`
+Runs only `hm-gateway` on the speaker (skipping `hm-core` and `hm-kws`), paired with **Full Docker `hm-core`** (with in-process Silero neural VAD — never `--slim`) on your LAN NAS/server:
 
 ```bash
 # 1. Start standard FULL Docker hm-core on your NAS/server (HM_GATEWAY_ALLOW_LAN=1; pair token at :8930)
@@ -119,8 +126,8 @@ chmod +x build/lx06/init.sh build/lx06/unxz
 ```
 *(Even with `--allow-lan-core`, `hm-gateway` strictly permits only loopback + RFC 1918 + Tailscale `100.64/10` + IPv6 ULA `fc00::/7` — public IPs are always rejected. `--core-token` is stored `chmod 600` in `/data/hm/core.token` and injected via `HM_CORE_AUTH_TOKEN`. Omit `--core-addr` for SSH reverse tunnel `127.0.0.1:8932`.)*
 
-#### Option 3B (No-NAS Standalone Trial): 128 MB On-Device Pure-ASR (`--standalone-asr`)
-If you do **not** have an always-on NAS or server, a 128 MB LX06 can skip local `hm-kws` (saving ~50–68 MiB RAM) and run **`hm-core --slim` (`HM_VOICE_EVENTS=0` to protect 58 MB `/tmp`) + `hm-gateway` + `:8930` Web Console** entirely on the speaker (~26–31 MiB net RAM, ~22–30 MiB free headroom, needs `>= 5.5 MiB` free on `/data`):
+#### Option 3B (Experimental · Not Recommended for Daily Use): 128 MB On-Device Pure-ASR (`--standalone-asr`)
+Kept strictly for experimentation when no NAS/server is available: skips local `hm-kws` and runs **`hm-core --slim` (`HM_VOICE_EVENTS=0`) + `hm-gateway` + `:8930` Web Console** on the speaker (needs `>= 5.5 MiB` free on `/data`). Because `/tmp` is RAM-backed and stock XiaoAi leaves only ~51 MiB available, real 128 MB units frequently suffer memory pressure, high load, and poor wake reliability — **do not expect smooth daily operation**:
 
 ```bash
 # 1. Download prebuilt v0.0.56 main bundle (or build via ./tools/pack_lx06_bundle.sh --standalone-asr)
