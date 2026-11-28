@@ -102,11 +102,11 @@ Runs only `hm-gateway` on the speaker (~4 MiB RAM, leaving ~50 MiB free), paired
 # 1. Start standard FULL Docker hm-core on your NAS/server (HM_GATEWAY_ALLOW_LAN=1; pair token at :8930)
 git clone https://github.com/yes999zc/home-mate.git && cd home-mate && docker compose up -d
 
-# 2. Download prebuilt v0.0.55 thin assets (or build via ./tools/pack_lx06_bundle.sh --thin) & install
+# 2. Download prebuilt v0.0.56 thin assets (or build via ./tools/pack_lx06_bundle.sh --thin) & install
 git clone https://github.com/yes999zc/home-mate-gateway-linux.git && cd home-mate-gateway-linux
 mkdir -p build/lx06
 for f in hm-lx06-thin.tar.xz hm-lx06-thin.sha256 init.sh unxz SHA256SUMS.txt; do
-  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.55/$f" -o "build/lx06/$f"
+  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.56/$f" -o "build/lx06/$f"
 done
 (cd build/lx06 && grep -E 'hm-lx06-thin|init\.sh|unxz' SHA256SUMS.txt | shasum -a 256 -c -)
 chmod +x build/lx06/init.sh build/lx06/unxz
@@ -123,11 +123,11 @@ chmod +x build/lx06/init.sh build/lx06/unxz
 If you do **not** have an always-on NAS or server, a 128 MB LX06 can skip local `hm-kws` (saving ~50–68 MiB RAM) and run **`hm-core --slim` (`HM_VOICE_EVENTS=0` to protect 58 MB `/tmp`) + `hm-gateway` + `:8930` Web Console** entirely on the speaker (~26–31 MiB net RAM, ~22–30 MiB free headroom, needs `>= 5.5 MiB` free on `/data`):
 
 ```bash
-# 1. Download prebuilt v0.0.55 main bundle (or build via ./tools/pack_lx06_bundle.sh --standalone-asr)
+# 1. Download prebuilt v0.0.56 main bundle (or build via ./tools/pack_lx06_bundle.sh --standalone-asr)
 git clone https://github.com/yes999zc/home-mate-gateway-linux.git && cd home-mate-gateway-linux
 mkdir -p build/lx06
 for f in hm-bundle.tar.xz hm-bundle.sha256 init.sh unxz SHA256SUMS.txt; do
-  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.55/$f" -o "build/lx06/$f"
+  curl -fL "https://github.com/yes999zc/home-mate-gateway-linux/releases/download/v0.0.56/$f" -o "build/lx06/$f"
 done
 (cd build/lx06 && grep -E 'hm-bundle|init\.sh|unxz' SHA256SUMS.txt | shasum -a 256 -c -)
 chmod +x build/lx06/init.sh build/lx06/unxz

@@ -4,5 +4,5 @@ members = ["crates/gateway"]
 
 [workspace.package]
 edition = "2021"
-version = "0.0.55"
+version = "0.0.56"
 license-file = "LICENSE"
